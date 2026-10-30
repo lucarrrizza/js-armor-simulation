@@ -559,5 +559,11 @@
   }
 
 
-  G.ImpactSim = { Sim, MATS, MAT_BY_ID, PROJECTILES };
+  // shared with the WebAssembly and WebGPU engines so all engines use identical physics parameters
+  const PHYS = {
+    R0, HEAT_V, HEAT_K, PLASTIC_HEAT, MIN_REST, BREAK_HEAT, FRICTION, DET_HEAT, DET_SPEED, BLAST_R, BLAST_J,
+    NM, MK, MY, MFR, MCR, MMELT, MCB, MMASS, MEXP, KC, CC,
+  };
+
+  G.ImpactSim = { Sim, MATS, MAT_BY_ID, PROJECTILES, PHYS };
 })(typeof window !== 'undefined' ? window : globalThis);

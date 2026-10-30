@@ -83,6 +83,14 @@
     <div class="btns"><button id="addLayer">+ Layer</button></div>
 
     <h2>Simulation</h2>
+    <label class="row"><span>Engine</span>
+      <select id="engine">
+        <option value="gpu">GPU (WebGPU)</option>
+        <option value="wasm">Multi-core CPU (Rust)</option>
+        <option value="js">Single-core CPU (JS)</option>
+      </select></label>
+    <label class="row" id="threadsRow"><span>CPU threads</span><select id="threads"></select></label>
+    <div id="engineInfo" class="hint"></div>
     <label class="row"><span>Resolution (mm / particle)</span>
       <select id="res"><option>1</option><option>1.5</option><option>2</option><option selected>3</option><option>4</option><option>5</option><option>6</option></select></label>
     <div id="count" class="hint"></div>
@@ -102,6 +110,8 @@
   </div>
 </div>
 <script src="sim.js"></script>
+<script src="engines/wasm.js"></script>
+<script src="engines/gpu.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

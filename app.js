@@ -104,20 +104,76 @@
   }
 
   function rebuild(keepCamera) {
+    if (!engineReady) return;
     scenario = scenarioFromUI();
-    sim = new Sim();
+    sim = engineObj || new Sim();
     sim.build(scenario);
     running = false;
     $('pause').textContent = 'Play (Space)';
     $('count').textContent = `${sim.n.toLocaleString()} particles · ${sim.nb.toLocaleString()} bonds` +
-      (sim.n > 60000 ? ' — heavy! consider a coarser resolution' : '');
+      (sim.n > 60000 && engineKind === 'js' ? ' — heavy! try the GPU / multi-core engine or a coarser resolution' : '');
     setupBuffers();
     if (keepCamera !== true) fitView();
     buildLegend();
     lastStats = sim.stats();
   }
 
+  // ---------- engines ----------
+  const engineSel = $('engine'), threadsSel = $('threads');
+  const hwThreads = navigator.hardwareConcurrency || 4;
+  for (let t = 1; t <= Math.min(64, hwThreads); t++) threadsSel.add(new Option(String(t), String(t)));
+  threadsSel.value = String(Math.max(1, Math.min(hwThreads - 1, Math.round(hwThreads * 0.7))));
+  const engineAvail = { gpu: GpuSim.available(), wasm: WasmSim.available(), js: true };
+  const engineWhy = { gpu: 'no WebGPU in this browser', wasm: 'start with: python3 serve.py' };
+  for (const o of engineSel.options) {
+    if (!engineAvail[o.value]) { o.disabled = true; o.textContent += ` — ${engineWhy[o.value]}`; }
+  }
+  const engineCache = {};
+  let engineKind = 'js', engineObj = null, engineReady = false;
+
+  async function createEngine(kind) {
+    if (kind === 'gpu') return engineCache.gpu || (engineCache.gpu = await GpuSim.create());
+    if (kind === 'wasm') {
+      const t = +threadsSel.value;
+      if (engineCache.wasm && engineCache.wasm.threads !== t) { engineCache.wasm.dispose(); engineCache.wasm = null; }
+      return engineCache.wasm || (engineCache.wasm = await WasmSim.create(t));
+    }
+    return null;
+  }
+
+  async function selectEngine(kind) {
+    running = false;
+    engineReady = false;
+    $('engineInfo').textContent = 'starting engine…';
+    let msg = '';
+    try {
+      if (!engineAvail[kind]) throw new Error(engineWhy[kind]);
+      engineObj = await createEngine(kind);
+      engineKind = kind;
+    } catch (e) {
+      console.error(e);
+      msg = `${kind === 'gpu' ? 'GPU' : 'multi-core'} engine unavailable (${e.message}); using single-core JS. `;
+      engineObj = null; engineKind = 'js';
+    }
+    engineSel.value = engineKind;
+    $('threadsRow').style.display = engineKind === 'wasm' ? '' : 'none';
+    $('engineInfo').textContent = msg + 'Running on ' + (engineObj ? engineObj.engineName : 'single-core CPU (JS)');
+    try { localStorage.setItem('impactEngine', engineKind); } catch (e) { /* storage disabled */ }
+    engineReady = true;
+    rebuild(!!sim);
+  }
+  engineSel.addEventListener('change', () => selectEngine(engineSel.value));
+  threadsSel.addEventListener('change', () => selectEngine('wasm'));
+
+  function initialEngine() {
+    let want = new URLSearchParams(location.search).get('engine');
+    if (!want) try { want = localStorage.getItem('impactEngine'); } catch (e) { /* storage disabled */ }
+    if (want && engineAvail[want]) return want;
+    return engineAvail.gpu ? 'gpu' : engineAvail.wasm ? 'wasm' : 'js';
+  }
+
   function fire() {
+    if (!engineReady) return;
     const cam0 = Object.assign({}, cam);
     rebuild(true);
     Object.assign(cam, cam0);
@@ -127,7 +183,12 @@
 
   $('fire').onclick = fire;
   $('pause').onclick = togglePause;
-  $('stepBtn').onclick = () => { running = false; $('pause').textContent = 'Play (Space)'; sim.advance(usPerFrame(), 400); };
+  $('stepBtn').onclick = () => {
+    running = false; $('pause').textContent = 'Play (Space)';
+    if (!sim || advancing) return;
+    advancing = true;
+    Promise.resolve(sim.advance(usPerFrame(), 400)).finally(() => { advancing = false; });
+  };
   $('fitBtn').onclick = fitView;
   function togglePause() { running = !running; $('pause').textContent = running ? 'Pause (Space)' : 'Play (Space)'; }
 
@@ -387,11 +448,20 @@
       `bonds ${s.bonds.toLocaleString()} · ${fps.toFixed(0)} fps · sim ${simMs.toFixed(1)} ms`;
   }
 
-  function loop() {
-    if (running && sim) {
+  let advancing = false;
+  async function loop() {
+    if (running && sim && !advancing) {
+      advancing = true;
       const t0 = performance.now();
-      const r = sim.advance(usPerFrame(), 300);
-      lagging = r.lagging;
+      try {
+        const r = await sim.advance(usPerFrame(), 300);
+        lagging = r.lagging;
+      } catch (e) {
+        console.error(e);
+        running = false;
+      } finally {
+        advancing = false;
+      }
       simMs = simMs * 0.9 + (performance.now() - t0) * 0.1;
     }
     if (sim) {
@@ -428,6 +498,6 @@
   pType.value = 'apfsds'; loadProjectileDefaults();
   preset.value = 'rha150'; loadPreset();
   updateLabels();
-  rebuild();
   requestAnimationFrame(loop);
+  selectEngine(initialEngine());
 })();
