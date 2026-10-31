@@ -30,6 +30,44 @@ Pick one under **Simulation → Engine** (or add `?engine=gpu|wasm|js` to the UR
 
 All engines share the same physics, so results agree to within a few percent.
 
+**Resolution** (Simulation → Resolution) goes down to 0.5 mm, which is about 1 million particles for a
+500 mm block. Use the GPU engine for anything finer than about 2 mm. When a frame can't keep up, the
+sim runs in slow motion ("slowed" in the stats) and the page stays responsive.
+
+## Rendering
+
+Pick one under **Playback → Renderer** (or add `?render=cinematic|standard|2d` to the URL):
+
+| Renderer | Notes |
+|---|---|
+| Cinematic | WebGPU: HDR bloom, glowing hot metal, motion-blurred debris, explosion fireballs, sparks, smoke and shock-wave distortion |
+| Standard | WebGPU: plain colours, light glow |
+| Basic (2D) | Canvas 2D fallback for browsers without WebGPU |
+
+Explosions from explosive materials (e.g. the ERA preset) are visual only; they don't push on the sim.
+
+## Drawing
+
+Use the **Draw** section to add your own armor and projectiles:
+
+| Tool | Key | Notes |
+|---|---|---|
+| Pan | V | drag to move, wheel to zoom, double-click to fit |
+| Brush | B | freehand strokes, width = *Brush / eraser size* |
+| Line | L | Shift snaps to 15° |
+| Rectangle | X | Shift makes a square |
+| Circle | C | |
+| Eraser | E | removes material (including preset parts) |
+
+- **Paint as** sets what a shape becomes:
+  - **Armor / object**: uses the selected material.
+  - **Projectile**: also takes a speed and direction, shown as an arrow.
+  - **Pin**: clamps armor in place.
+- Any mouse button other than the left one always pans.
+- Ctrl+Z undoes. **Clear drawing** removes everything drawn.
+- Set **Projectile → Type** to **None** to use only your drawn ones.
+- Drawings are saved in the browser (localStorage) and rebuilt at the current resolution.
+
 ## Rebuilding the Rust engine
 
 The compiled `wasm/armor_sim.wasm` is checked in, so this is only needed after editing `rust/src/lib.rs`:

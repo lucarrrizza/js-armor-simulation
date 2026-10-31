@@ -79,6 +79,7 @@
     heat: { name: 'HEAT / shaped-charge jet', mat: 'copper', D: 8, L: 450, v: 8000 },
     bullet: { name: 'AP rifle bullet', mat: 'hhs', D: 8, L: 32, v: 850 },
     sphere: { name: 'Sphere', mat: 'rha', D: 40, L: 40, v: 3000 },
+    none: { name: 'None (drawn projectiles only)', mat: 'tungsten', D: 20, L: 100, v: 1500 },
   };
 
   function projectileBodies(p, u) {
@@ -135,6 +136,82 @@
       }
     }
     return bodies;
+  }
+
+  // ---- user drawings ----
+  // Shapes are stored in world millimetres (independent of resolution):
+  //   { kind: 'brush'|'line'|'rect'|'circle', role: 'armor'|'projectile'|'anchor'|'erase',
+  //     mat, size (stroke width, mm), pts: [[x, y], ...], v (m/s), dir (deg, 0 = +x, counter-clockwise) }
+  // They are rasterized onto a global hexagonal lattice, applied in order (later shapes win).
+  const LAT_OFF = 1 << 20;
+  const latKey = (r, k) => (r + LAT_OFF) * 4194304 + (k + LAT_OFF);
+  // x is shifted by a quarter unit so nodes don't sit exactly on the 2D renderer's pixel edges
+  const LAT_X = 0.25;
+  const latPos = (r, k) => [k + (r & 1 ? 0.5 : 0) + LAT_X, r * ROW];
+
+  function forShapeNodes(s, res, fn) {
+    const P = s.pts.map(([x, y]) => [x / res, y / res]);
+    const visit = (x0, x1, y0, y1, inside) => {
+      for (let r = Math.floor(y0 / ROW); r <= Math.ceil(y1 / ROW); r++) {
+        const o = (r & 1 ? 0.5 : 0) + LAT_X;
+        for (let k = Math.floor(x0 - o); k <= Math.ceil(x1 - o); k++) {
+          const [x, y] = latPos(r, k);
+          if (inside(x, y)) fn(r, k);
+        }
+      }
+    };
+    if (s.kind === 'rect') {
+      const [a, b] = P;
+      const x0 = Math.min(a[0], b[0]), x1 = Math.max(a[0], b[0]), y0 = Math.min(a[1], b[1]), y1 = Math.max(a[1], b[1]);
+      visit(x0, x1, y0, y1, (x, y) => x >= x0 && x <= x1 && y >= y0 && y <= y1);
+    } else if (s.kind === 'circle') {
+      const [c, e] = P;
+      const R = Math.hypot(e[0] - c[0], e[1] - c[1]);
+      visit(c[0] - R, c[0] + R, c[1] - R, c[1] + R, (x, y) => (x - c[0]) ** 2 + (y - c[1]) ** 2 <= R * R);
+    } else {
+      const rr = Math.max(0.5, s.size / 2 / res);
+      const segs = P.length === 1 ? [[P[0], P[0]]] : P.slice(1).map((p, i) => [P[i], p]);
+      for (const [a, b] of segs) {
+        const dx = b[0] - a[0], dy = b[1] - a[1], l2 = dx * dx + dy * dy;
+        visit(Math.min(a[0], b[0]) - rr, Math.max(a[0], b[0]) + rr, Math.min(a[1], b[1]) - rr, Math.max(a[1], b[1]) + rr, (x, y) => {
+          const t = l2 > 0 ? Math.max(0, Math.min(1, ((x - a[0]) * dx + (y - a[1]) * dy) / l2)) : 0;
+          return (x - a[0] - t * dx) ** 2 + (y - a[1] - t * dy) ** 2 <= rr * rr;
+        });
+      }
+    }
+  }
+
+  function rasterizeDrawing(shapes, res) {
+    const cells = new Map(), touched = new Set(), pins = new Set();
+    for (const s of shapes || []) {
+      if (!s.pts || !s.pts.length) continue;
+      if (s.role === 'anchor') { forShapeNodes(s, res, (r, k) => pins.add(latKey(r, k))); continue; }
+      if (s.role === 'erase') {
+        forShapeNodes(s, res, (r, k) => { const key = latKey(r, k); cells.delete(key); touched.add(key); });
+        continue;
+      }
+      const mat = (MAT_BY_ID[s.mat] || MAT_BY_ID.rha).index;
+      const proj = s.role === 'projectile';
+      const a = (s.dir || 0) * Math.PI / 180, v = proj ? (s.v || 0) / 100 : 0;
+      const entry = { mat, grp: proj ? 1 : 0, vx: v * Math.cos(a), vy: -v * Math.sin(a),
+        body: `${s.role}|${s.mat}|${proj ? s.v + '|' + s.dir : ''}` };
+      forShapeNodes(s, res, (r, k) => { const key = latKey(r, k); cells.set(key, Object.assign({ r, k }, entry)); touched.add(key); });
+    }
+    // true if any drawn/erased lattice node lies within contact range of (x, y)
+    const near = (set, x, y, rad) => {
+      if (!set.size) return false;
+      const r0 = Math.round(y / ROW);
+      for (let r = r0 - 1; r <= r0 + 1; r++) {
+        const o = (r & 1 ? 0.5 : 0) + LAT_X, k0 = Math.round(x - o);
+        for (let k = k0 - 1; k <= k0 + 1; k++) {
+          if (!set.has(latKey(r, k))) continue;
+          const [nx, ny] = latPos(r, k);
+          if ((nx - x) ** 2 + (ny - y) ** 2 < rad * rad) return true;
+        }
+      }
+      return false;
+    };
+    return { cells, touched: (x, y) => near(touched, x, y, 0.9), pinned: (x, y) => near(pins, x, y, 0.75) };
   }
 
   class Sim {
@@ -205,11 +282,11 @@
 
       // ---- projectile ----
       const bodies = projectileBodies(scn.projectile, u);
-      const maxR = Math.max(...bodies.map((b) => b.R));
+      const maxR = Math.max(0, ...bodies.map((b) => b.R));
       let frontX = Infinity;
       for (let i = 0; i < T.x.length; i++) if (Math.abs(T.y[i]) < maxR + 1 && T.x[i] < frontX) frontX = T.x[i];
       if (!isFinite(frontX)) frontX = 0;
-      const tipLocal = Math.max(...bodies.map((b) => b.x1));
+      const tipLocal = Math.max(0, ...bodies.map((b) => b.x1));
       const offX = frontX - 3 - tipLocal;
       const offY = u(scn.offsetY || 0);
       for (const b of bodies) {
@@ -226,6 +303,29 @@
         bodyId++;
       }
       this.entryX = this.armorFront / Math.max(0.05, cs);
+
+      // ---- user drawing: replaces / erases base material, adds new bodies ----
+      if (scn.drawn && scn.drawn.length) {
+        const ras = rasterizeDrawing(scn.drawn, res);
+        const keep = [];
+        for (let i = 0; i < T.x.length; i++) {
+          if (ras.touched(T.x[i], T.y[i])) continue;
+          if (!T.grp[i] && ras.pinned(T.x[i], T.y[i])) T.pin[i] = 1;
+          keep.push(i);
+        }
+        if (keep.length !== T.x.length) for (const key in T) T[key] = keep.map((i) => T[key][i]);
+        const bodyOf = new Map();
+        for (const c of ras.cells.values()) {
+          if (!bodyOf.has(c.body)) bodyOf.set(c.body, bodyOf.size);
+        }
+        const base = bodyId;
+        for (const c of ras.cells.values()) {
+          const [x, y] = latPos(c.r, c.k);
+          bodyId = base + bodyOf.get(c.body);
+          add(x, y, c.vx, c.vy, c.mat, c.grp, !c.grp && ras.pinned(x, y));
+        }
+        bodyId = base + bodyOf.size;
+      }
 
       // ---- allocate ----
       const n = T.x.length;
@@ -256,6 +356,7 @@
         if (this.px[i] < x0) x0 = this.px[i]; if (this.px[i] > x1) x1 = this.px[i];
         if (this.py[i] < y0) y0 = this.py[i]; if (this.py[i] > y1) y1 = this.py[i];
       }
+      if (!n) { x0 = -50; x1 = 50; y0 = -50; y1 = 50; }
       this.fit = { x0, x1, y0, y1 };
       const span = Math.max(x1 - x0, y1 - y0);
       const mg = Math.max(60, span * 0.4);
@@ -282,6 +383,7 @@
       this.dtStab = Infinity;
       const present = new Set(T.mat);
       for (const m of present) this.dtStab = Math.min(this.dtStab, DT_FACTOR * 106 / MATS[m].c);
+      if (!isFinite(this.dtStab)) this.dtStab = DT_FACTOR;
       this.updateVmax();
     }
 
@@ -523,10 +625,12 @@
     }
 
     // advance by `us` microseconds of simulated time, at most maxSteps substeps
-    advance(us, maxSteps) {
+    // maxSteps caps work per frame; the wall-clock budget keeps the UI responsive on big scenes
+    advance(us, maxSteps, budgetMs = 30) {
+      const t0 = performance.now();
       let remaining = us / this.usPerT;
       let steps = 0;
-      while (remaining > 1e-9 && steps < maxSteps) {
+      while (remaining > 1e-9 && steps < maxSteps && (steps === 0 || performance.now() - t0 < budgetMs)) {
         const dt = Math.min(this.dtStab, 0.15 / Math.max(1e-6, this.vmax), remaining);
         this.step(dt);
         remaining -= dt;
@@ -546,13 +650,14 @@
         if (lx > this.armorDepth + 1) { mBehind += m; pBehind += m * vx[i]; }
         if (px[i] > maxX) maxX = px[i];
       }
+      const pm0 = this.projMass0 || 1;
       return {
         timeUs: this.time * this.usPerT,
-        massLeft: mAlive / this.projMass0,
-        massBehind: mBehind / this.projMass0,
+        massLeft: mAlive / pm0,
+        massBehind: mBehind / pm0,
         residualV: mBehind > 0 ? (pBehind / mBehind) * 100 : 0,
         depthMm: Math.max(0, Math.min(this.stackLos, (maxX - this.entryX) * this.res)),
-        perforated: mBehind / this.projMass0 > 0.02,
+        perforated: mBehind / pm0 > 0.02,
         bonds: this.nb,
       };
     }

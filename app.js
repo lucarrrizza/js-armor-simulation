@@ -88,6 +88,9 @@
 
   // ---------- simulation ----------
   let sim = null, running = false, scenario = null;
+  let drawn = []; // user-drawn shapes (see rasterizeDrawing in sim.js)
+  try { drawn = JSON.parse(localStorage.getItem('impactDrawn') || '[]'); } catch (e) { /* storage disabled */ }
+  if (!Array.isArray(drawn)) drawn = [];
 
   function scenarioFromUI() {
     return {
@@ -96,6 +99,7 @@
       plateH: Math.max(20, +$('plateH').value),
       layers: layers.map((l) => Object.assign({}, l)),
       offsetY: +$('pOff').value || 0,
+      drawn: drawn.map((d) => Object.assign({}, d)),
       projectile: {
         type: pType.value, mat: pMat.value,
         D: Math.max(1, +$('pD').value), L: Math.max(1, +$('pL').value), v: Math.max(1, +$('pV').value),
@@ -107,11 +111,23 @@
     if (!engineReady) return;
     scenario = scenarioFromUI();
     sim = engineObj || new Sim();
-    sim.build(scenario);
+    // the GPU engine only reads every particle back when the 2D canvas renderer needs them
+    if (engineKind === 'gpu') sim.readAll = !gpuRendering();
     running = false;
     $('pause').textContent = 'Play (Space)';
+    try {
+      sim.build(scenario);
+    } catch (e) {
+      console.error(e);
+      sim = null;
+      $('count').textContent = `Could not build this scene: ${e.message}. Try a coarser resolution.`;
+      return;
+    }
+    const heavy = (engineKind === 'js' && sim.n > 60000) || (engineKind === 'wasm' && sim.n > 500000);
     $('count').textContent = `${sim.n.toLocaleString()} particles · ${sim.nb.toLocaleString()} bonds` +
-      (sim.n > 60000 && engineKind === 'js' ? ' — heavy! try the GPU / multi-core engine or a coarser resolution' : '');
+      (heavy ? ' — heavy! try the GPU engine or a coarser resolution' : '');
+    if (renderer) renderer.reset();
+    lastFxUs = 0;
     setupBuffers();
     if (keepCamera !== true) fitView();
     buildLegend();
@@ -194,6 +210,11 @@
 
   window.addEventListener('keydown', (e) => {
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+    if ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z')) { e.preventDefault(); undo(); return; }
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    const toolKeys = { b: 'brush', l: 'line', x: 'rect', c: 'circle', e: 'erase', v: 'pan' };
+    if (toolKeys[e.key.toLowerCase()]) { setTool(toolKeys[e.key.toLowerCase()]); return; }
+    if (e.key === 'Escape') { if (drawing) drawing = null; else setTool('pan'); return; }
     if (e.code === 'Space') { e.preventDefault(); togglePause(); }
     else if (e.key === 'r' || e.key === 'R') fire();
     else if (e.key === 'f' || e.key === 'F') fitView();
@@ -203,6 +224,7 @@
   // ---------- rendering ----------
   const canvas = $('view');
   const ctx = canvas.getContext('2d');
+  const glCanvas = $('gl');
   const SS = 2;               // offscreen pixels per world unit
   const GS = 0.5;             // glow buffer pixels per world unit
   const off = document.createElement('canvas'), offCtx = off.getContext('2d');
@@ -216,6 +238,7 @@
     const r = canvas.getBoundingClientRect();
     W = r.width; H = r.height;
     canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
+    glCanvas.width = canvas.width; glCanvas.height = canvas.height;
   }
   window.addEventListener('resize', resize);
 
@@ -294,7 +317,7 @@
       }).join(',') + ')';
       const info = {
         stress: [stressLUT, 'intact', 'about to break'],
-        vel: [turboLUT, '0', (scenario.projectile.v).toFixed(0) + ' m/s'],
+        vel: [turboLUT, '0', refV().toFixed(0) + ' m/s'],
         heat: [heatLUT, 'cold', 'white hot'],
       }[mode];
       html = `<div style="flex-direction:column;align-items:stretch"><i style="width:160px;height:10px;background:${grad(info[0])}"></i>` +
@@ -304,6 +327,13 @@
   }
   $('viewMode').addEventListener('change', buildLegend);
 
+  // fastest projectile in the scene (m/s): the top of the velocity colour scale
+  function refV() {
+    let v = scenario.projectile.type === 'none' ? 0 : scenario.projectile.v;
+    for (const d of scenario.drawn) if (d.role === 'projectile') v = Math.max(v, d.v || 0);
+    return v || 1000;
+  }
+
   function drawParticles() {
     const { n, px, py, alive, mat, heat, stress, vx, vy } = sim;
     const ow = off.width, oh = off.height, gw = glowC.width, gh = glowC.height;
@@ -312,7 +342,7 @@
     const glow = $('glow').checked;
     buf32.fill(0);
     if (glow) { gR.fill(0); gG.fill(0); gB.fill(0); }
-    const vScale = (HL - 1) / Math.max(1, scenario.projectile.v / 100);
+    const vScale = (HL - 1) / Math.max(1, refV() / 100);
     let anyGlow = false;
     for (let i = 0; i < n; i++) {
       if (!alive[i]) continue;
@@ -355,6 +385,10 @@
   function drawBackground() {
     ctx.fillStyle = '#0f1217';
     ctx.fillRect(0, 0, W, H);
+    drawGrid();
+  }
+
+  function drawGrid() {
     // grid every 50 mm (or 100/250 when zoomed out)
     const mmPx = cam.scale / sim.res;
     let step = 50; if (step * mmPx < 25) step = 100; if (step * mmPx < 25) step = 250; if (step * mmPx < 25) step = 500;
@@ -415,6 +449,14 @@
 
   function render() {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    if (gpuRendering()) {
+      renderGpu();
+      ctx.clearRect(0, 0, W, H);
+      drawGrid();
+      drawOverlay();
+      drawScaleBar();
+      return;
+    }
     drawBackground();
     const anyGlow = drawParticles();
     const [sx, sy] = worldToScreen(sim.bx0, sim.by0);
@@ -432,12 +474,34 @@
       }
       drawFlashes();
     }
+    drawOverlay();
     drawScaleBar();
+  }
+
+  const VIEW_MODES = { mat: 0, stress: 1, vel: 2, heat: 3 };
+  let lastFxUs = 0;
+  function renderGpu() {
+    const cine = rendererKind === 'cinematic';
+    if (sim.events.length) {
+      renderer.explode(sim.events, sim, cine);
+      sim.events.length = 0;
+    }
+    // effects advance with simulated time, so they freeze while paused and follow the slow-mo
+    const nowUs = sim.time * sim.usPerT;
+    const frameUs = Math.max(0, Math.min(20, nowUs - lastFxUs));
+    lastFxUs = nowUs;
+    renderer.render({
+      sim, cam, dpr, cinematic: cine, frameUs,
+      mode: VIEW_MODES[$('viewMode').value],
+      vRef: refV() / 100,
+      glow: $('glow').checked,
+      trailT: 1.5 * usPerFrame() / sim.usPerT,
+    });
   }
 
   function updateStats() {
     const s = lastStats;
-    const v0 = scenario.projectile.v;
+    const v0 = refV();
     $('stats').innerHTML =
       `t = <b>${s.timeUs.toFixed(1)} µs</b>${running ? '' : ' (paused)'}${lagging ? ' <span style="color:#f66">slowed</span>' : ''}<br>` +
       `impact ${v0.toFixed(0)} m/s · LOS armor ${sim.losThickness.toFixed(0)} mm` +
@@ -474,11 +538,219 @@
     requestAnimationFrame(loop);
   }
 
-  // ---------- camera interaction ----------
+  // ---------- renderer ----------
+  const rendererSel = $('renderer');
+  let renderer = null, rendererKind = '2d';
+  function gpuRendering() { return rendererKind !== '2d' && !!renderer; }
+
+  async function selectRenderer(kind) {
+    if (kind !== '2d' && !renderer) {
+      try {
+        if (!GpuRenderer.available()) throw new Error('no WebGPU in this browser');
+        renderer = await GpuRenderer.create(glCanvas);
+      } catch (e) {
+        console.error(e);
+        for (const o of rendererSel.options) if (o.value !== '2d') { o.disabled = true; o.textContent += ' — unavailable'; }
+        kind = '2d';
+      }
+    }
+    const readAllBefore = !gpuRendering();
+    rendererKind = kind;
+    rendererSel.value = kind;
+    glCanvas.style.display = kind === '2d' ? 'none' : 'block';
+    try { localStorage.setItem('impactRenderer', kind); } catch (e) { /* storage disabled */ }
+    if (renderer) renderer.reset();
+    if (sim && engineKind === 'gpu' && readAllBefore !== !gpuRendering()) rebuild(true);
+  }
+  rendererSel.addEventListener('change', () => selectRenderer(rendererSel.value));
+
+  function initialRenderer() {
+    let want = new URLSearchParams(location.search).get('render');
+    if (!want) try { want = localStorage.getItem('impactRenderer'); } catch (e) { /* storage disabled */ }
+    if (want === 'cinematic' || want === 'standard' || want === '2d') return want;
+    return GpuRenderer.available() ? 'standard' : '2d';
+  }
+
+  // ---------- drawing ----------
+  // Shapes are kept in millimetres so they survive resolution changes; every edit rebuilds the scene.
+  const dRole = $('dRole'), dMat = $('dMat');
+  for (const m of MATS) dMat.add(new Option(m.name, m.id));
+  const matByRole = { armor: 'rha', projectile: 'tungsten' };
+  let tool = 'pan', drawing = null, hover = null;
+
+  function setTool(t) {
+    tool = t;
+    for (const b of $('tools').children) b.classList.toggle('on', b.dataset.tool === t);
+    canvas.classList.toggle('draw', t !== 'pan');
+  }
+  for (const b of $('tools').children) b.onclick = () => setTool(b.dataset.tool);
+
+  function updateDrawUI() {
+    const role = dRole.value;
+    if (matByRole[role]) dMat.value = matByRole[role];
+    $('dMatRow').style.display = role === 'anchor' ? 'none' : '';
+    for (const el of document.querySelectorAll('.dProj')) el.style.display = role === 'projectile' ? '' : 'none';
+    $('dDirVal').textContent = $('dDir').value + '°';
+    const nProj = drawn.filter((d) => d.role === 'projectile').length;
+    $('dInfo').textContent = drawn.length
+      ? `${drawn.length} shape${drawn.length > 1 ? 's' : ''} drawn` + (nProj ? ` (${nProj} projectile${nProj > 1 ? 's' : ''})` : '') +
+        (nProj && pType.value !== 'none' ? '. Set projectile type to "None" to fire only your drawn projectiles.' : '.')
+      : 'Pick a tool, then left-drag on the view. Drawings are added on top of the armor preset; the eraser cuts through anything.';
+  }
+  dRole.addEventListener('change', updateDrawUI);
+  dMat.addEventListener('change', () => { if (matByRole[dRole.value]) matByRole[dRole.value] = dMat.value; });
+  $('dDir').addEventListener('input', updateDrawUI);
+  pType.addEventListener('change', updateDrawUI);
+
+  function drawingChanged() {
+    try { localStorage.setItem('impactDrawn', JSON.stringify(drawn)); } catch (e) { /* storage disabled */ }
+    updateDrawUI();
+    rebuild(true);
+  }
+  function undo() { if (drawn.length) { drawn.pop(); drawingChanged(); } }
+  $('dUndo').onclick = undo;
+  $('dClear').onclick = () => { if (drawn.length) { drawn = []; drawingChanged(); } };
+
+  function eventMm(e) {
+    const r = canvas.getBoundingClientRect();
+    const wx = (e.clientX - r.left - W / 2) / cam.scale + cam.x, wy = (e.clientY - r.top - H / 2) / cam.scale + cam.y;
+    return [Math.round(wx * sim.res * 10) / 10, Math.round(wy * sim.res * 10) / 10];
+  }
+
+  function startShape(e) {
+    const p = eventMm(e);
+    const erase = tool === 'erase';
+    const role = erase ? 'erase' : dRole.value;
+    const s = { kind: erase ? 'brush' : tool, role, size: Math.max(0.5, +$('dSize').value || 10), pts: [p] };
+    if (s.kind !== 'brush') s.pts.push(p.slice());
+    if (role === 'armor' || role === 'projectile') s.mat = dMat.value;
+    if (role === 'projectile') { s.v = Math.max(0, +$('dV').value || 0); s.dir = +$('dDir').value || 0; }
+    return s;
+  }
+
+  function extendShape(s, e) {
+    let p = eventMm(e);
+    if (s.kind === 'brush') {
+      const q = s.pts[s.pts.length - 1];
+      if (Math.hypot(p[0] - q[0], p[1] - q[1]) >= Math.max(0.5, s.size * 0.25)) s.pts.push(p);
+      return;
+    }
+    const a = s.pts[0];
+    if (e.shiftKey) { // snap lines to 15°, rects to squares
+      const dx = p[0] - a[0], dy = p[1] - a[1];
+      if (s.kind === 'line') {
+        const ang = Math.round(Math.atan2(dy, dx) / (Math.PI / 12)) * (Math.PI / 12), l = Math.hypot(dx, dy);
+        p = [a[0] + Math.cos(ang) * l, a[1] + Math.sin(ang) * l];
+      } else if (s.kind === 'rect') {
+        const m = Math.max(Math.abs(dx), Math.abs(dy));
+        p = [a[0] + Math.sign(dx || 1) * m, a[1] + Math.sign(dy || 1) * m];
+      }
+    }
+    s.pts[1] = p;
+  }
+
+  function finishShape(s) {
+    if (s.kind === 'rect' || s.kind === 'circle') {
+      const [a, b] = s.pts;
+      if (Math.hypot(b[0] - a[0], b[1] - a[1]) < sim.res) return; // just a click
+    }
+    drawn.push(s);
+    drawingChanged();
+  }
+
+  const ROLE_COL = { projectile: [255, 154, 60], anchor: [80, 200, 255], erase: [255, 80, 80] };
+  function shapeColor(s) { return ROLE_COL[s.role] || (MAT_BY_ID[s.mat] || MAT_BY_ID.rha).color; }
+
+  function tracePath(s) {
+    const P = s.pts.map(([x, y]) => worldToScreen(x / sim.res, y / sim.res));
+    ctx.beginPath();
+    if (s.kind === 'rect') {
+      const [a, b] = P;
+      ctx.rect(Math.min(a[0], b[0]), Math.min(a[1], b[1]), Math.abs(b[0] - a[0]), Math.abs(b[1] - a[1]));
+      return true;
+    }
+    if (s.kind === 'circle') {
+      const [c, e] = P;
+      ctx.arc(c[0], c[1], Math.hypot(e[0] - c[0], e[1] - c[1]), 0, Math.PI * 2);
+      return true;
+    }
+    ctx.moveTo(P[0][0], P[0][1]);
+    for (let i = 1; i < P.length; i++) ctx.lineTo(P[i][0], P[i][1]);
+    if (P.length === 1) ctx.lineTo(P[0][0] + 0.01, P[0][1]);
+    return false;
+  }
+
+  function drawShape(s, alpha) {
+    const c = shapeColor(s).join(',');
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    if (tracePath(s)) {
+      ctx.fillStyle = `rgba(${c},${alpha * 0.45})`; ctx.fill();
+      ctx.strokeStyle = `rgba(${c},${alpha})`; ctx.lineWidth = 1.5; ctx.stroke();
+    } else {
+      ctx.strokeStyle = `rgba(${c},${alpha * 0.6})`;
+      ctx.lineWidth = Math.max(1.5, s.size / sim.res * cam.scale);
+      ctx.stroke();
+    }
+  }
+
+  function shapeCenter(s) {
+    if (s.kind === 'rect') return [(s.pts[0][0] + s.pts[1][0]) / 2, (s.pts[0][1] + s.pts[1][1]) / 2];
+    if (s.kind === 'circle') return s.pts[0];
+    const n = s.pts.length;
+    return [s.pts.reduce((a, p) => a + p[0], 0) / n, s.pts.reduce((a, p) => a + p[1], 0) / n];
+  }
+
+  function drawArrow(s) {
+    const [cx, cy] = shapeCenter(s);
+    const [x, y] = worldToScreen(cx / sim.res, cy / sim.res);
+    const a = (s.dir || 0) * Math.PI / 180, dx = Math.cos(a), dy = -Math.sin(a);
+    const len = 28 + Math.min(90, (s.v || 0) / 40);
+    const ex = x + dx * len, ey = y + dy * len;
+    ctx.strokeStyle = ctx.fillStyle = 'rgba(255,190,110,0.9)';
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(ex, ey); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(ex + dx * 6, ey + dy * 6);
+    ctx.lineTo(ex - dy * 5 - dx * 4, ey + dx * 5 - dy * 4); ctx.lineTo(ex + dy * 5 - dx * 4, ey - dx * 5 - dy * 4);
+    ctx.fill();
+    ctx.font = '11px system-ui';
+    ctx.fillText(`${s.v} m/s`, ex + 8, ey + 4);
+  }
+
+  // drawing previews: the shape being drawn, pins, projectile launch arrows and the brush cursor
+  function drawOverlay() {
+    if (sim.time === 0 || tool !== 'pan') {
+      for (const s of scenario.drawn) {
+        if (s.role === 'anchor') { ctx.setLineDash([4, 4]); drawShape(s, 0.5); ctx.setLineDash([]); }
+      }
+    }
+    if (sim.time === 0) for (const s of scenario.drawn) if (s.role === 'projectile' && s.v > 0) drawArrow(s);
+    if (drawing) drawShape(drawing, 0.9);
+    if (hover && !drawing && (tool === 'brush' || tool === 'erase' || tool === 'line')) {
+      const [x, y] = worldToScreen(hover[0] / sim.res, hover[1] / sim.res);
+      const r = Math.max(1, (+$('dSize').value || 10) / 2 / sim.res * cam.scale);
+      ctx.strokeStyle = tool === 'erase' ? 'rgba(255,90,90,0.8)' : 'rgba(255,255,255,0.6)';
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.stroke();
+    }
+  }
+
+  // ---------- mouse: left button draws with a draw tool, otherwise any button pans ----------
   let drag = null;
-  canvas.addEventListener('mousedown', (e) => { drag = { x: e.clientX, y: e.clientY, cx: cam.x, cy: cam.y }; canvas.classList.add('drag'); });
-  window.addEventListener('mouseup', () => { drag = null; canvas.classList.remove('drag'); });
+  canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+  canvas.addEventListener('mousedown', (e) => {
+    if (!sim) return;
+    if (tool !== 'pan' && e.button === 0) { drawing = startShape(e); return; }
+    e.preventDefault();
+    drag = { x: e.clientX, y: e.clientY, cx: cam.x, cy: cam.y };
+    canvas.classList.add('drag');
+  });
+  window.addEventListener('mouseup', () => {
+    if (drawing) { const s = drawing; drawing = null; if (sim) finishShape(s); }
+    drag = null; canvas.classList.remove('drag');
+  });
   window.addEventListener('mousemove', (e) => {
+    hover = sim && e.target === canvas ? eventMm(e) : null;
+    if (drawing && sim) { extendShape(drawing, e); return; }
     if (!drag) return;
     cam.x = drag.cx - (e.clientX - drag.x) / cam.scale;
     cam.y = drag.cy - (e.clientY - drag.y) / cam.scale;
@@ -491,13 +763,15 @@
     cam.scale = Math.max(0.05, Math.min(60, cam.scale * Math.exp(-e.deltaY * 0.0015)));
     cam.x = wx - (mx - W / 2) / cam.scale; cam.y = wy - (my - H / 2) / cam.scale;
   }, { passive: false });
-  canvas.addEventListener('dblclick', fitView);
+  canvas.addEventListener('dblclick', () => { if (tool === 'pan') fitView(); });
 
   // ---------- init ----------
   resize();
   pType.value = 'apfsds'; loadProjectileDefaults();
   preset.value = 'rha150'; loadPreset();
   updateLabels();
+  setTool('pan');
+  updateDrawUI();
   requestAnimationFrame(loop);
-  selectEngine(initialEngine());
+  selectRenderer(initialRenderer()).then(() => selectEngine(initialEngine()));
 })();

@@ -2,11 +2,13 @@
 // GPU engine: the same particle/bond model as sim.js, run as WebGPU compute shaders.
 // All passes are written in "gather" form (each invocation only writes its own particle/bond).
 // The timestep, the clock and the ping-pong grid selection live on the GPU, so a whole frame of
-// substeps is encoded into one submission; one packed buffer is read back per frame for drawing.
+// substeps is encoded into one submission. The renderer draws straight from the particle buffers;
+// only the clock, detonation events and the projectile particles (for the stats) are read back.
 (function (G) {
   const { Sim, PHYS } = G.ImpactSim;
   const WG = 128;
   const K = 6, ADJ = 8, NONE = 0xffffffff, EVCAP = 2048;
+  const BATCH_MS = 40;
   const ALIVE = 256, FIRE = 512, INGRID = 1024;
   const MT = { MK: 0, MY: 16, MFR: 32, MCR: 48, MMELT: 64, MCB: 80, MEXP: 96, KC: 112, CC: 368, CONST: 624, LEN: 640 };
   const STATE_SIZE = 48;
@@ -23,7 +25,7 @@ const MK: u32 = ${MT.MK}u; const MY: u32 = ${MT.MY}u; const MFR: u32 = ${MT.MFR}
 const MMELT: u32 = ${MT.MMELT}u; const MCB: u32 = ${MT.MCB}u; const MEXP: u32 = ${MT.MEXP}u;
 const KC: u32 = ${MT.KC}u; const CC: u32 = ${MT.CC}u; const CN: u32 = ${MT.CONST}u;
 struct Params {
-  n: u32, nb: u32, nexpl: u32, gw: u32, gh: u32, cells: u32, nm: u32, pad0: u32,
+  n: u32, nb: u32, nexpl: u32, gw: u32, gh: u32, cells: u32, nm: u32, lo: u32,
   gx0: f32, gy0: f32, bx0: f32, by0: f32, bx1: f32, by1: f32, dtStab: f32, pad1: f32,
 };
 struct State {
@@ -54,7 +56,6 @@ struct State {
   const KERNELS = {
     dt: [['P', 'st'], /* wgsl */`
 @compute @workgroup_size(1) fn main() {
-  if (st.pending == 1u) { st.cur = 1u - st.cur; st.pending = 0u; }
   let v = sqrt(bitcast<f32>(atomicLoad(&st.vacc)));
   let full = min(P.dtStab, 0.15 / max(1e-6, v));
   var dt = 0.0;
@@ -70,7 +71,6 @@ struct State {
     st.steps = st.steps + 1u;
     atomicStore(&st.vacc, 0u);
     atomicStore(&st.fire, 0u);
-    st.pending = 1u;
   }
 }`],
 
@@ -101,7 +101,6 @@ struct State {
   if (c < 0 || (m.w & INGRID) == 0u) { return; }
   let p = pv[i];
   let mi = (m.w & 255u) * P.nm;
-  let g = i32(st.cur * P.cells);
   let r0 = mt[CN]; let r0sq = r0 * r0;
   let heatV = mt[CN + 1u]; let heatK = mt[CN + 2u] * dt; let fric = mt[CN + 6u];
   let gw = i32(P.gw);
@@ -109,7 +108,7 @@ struct State {
   var h = 0.0;
   for (var dy = -1; dy <= 1; dy++) {
     for (var dx = -1; dx <= 1; dx++) {
-      let cc = u32(g + c + dy * gw + dx);
+      let cc = u32(c + dy * gw + dx);
       let cnt = min(atomicLoad(&gcnt[cc]), K);
       for (var s = 0u; s < cnt; s++) {
         let j = gslot[cc * K + s];
@@ -193,15 +192,11 @@ struct State {
   bout[b] = vec4<f32>(f * nrm, h, abs(tot) / mfr);
 }`],
 
-    integrate: [['P', 'st', 'pv', 'pa', 'pm', 'adj', 'bout', 'gcnt', 'gslot'], /* wgsl */`
+    integrate: [['P', 'st', 'pv', 'pa', 'pm', 'adj', 'bout'], /* wgsl */`
 var<workgroup> wmax: atomic<u32>;
 fn one(i: u32, dt: f32) -> f32 {
   let m = pm[i];
-  let gc = st.cur * P.cells;
-  let gn = (1u - st.cur) * P.cells;
-  let old = bitcast<i32>(m.z);
-  if (old >= 0) { atomicStore(&gcnt[gc + u32(old)], 0u); }
-  if ((m.w & ALIVE) == 0u) { pm[i].z = NONE; return 0.0; }
+  if ((m.w & ALIVE) == 0u) { return 0.0; }
   let a = pa[i];
   var f = a.xy;
   var hb = 0.0;
@@ -229,17 +224,10 @@ fn one(i: u32, dt: f32) -> f32 {
     if (!(x.x >= P.bx0 && x.x <= P.bx1 && x.y >= P.by0 && x.y <= P.by1 && v2 < 1e12)) {
       pv[i] = p;
       pm[i].w = m.w & ~ALIVE;
-      pm[i].z = NONE;
       return 0.0;
     }
   }
   pv[i] = p;
-  let c = i32(p.x - P.gx0) + i32(p.y - P.gy0) * i32(P.gw);
-  let cc = gn + u32(c);
-  let slot = atomicAdd(&gcnt[cc], 1u);
-  if (slot < K) { gslot[cc * K + slot] = i; }
-  pm[i].z = bitcast<u32>(c);
-  pm[i].w = select(m.w & ~INGRID, m.w | INGRID, slot < K);
   return v2;
 }
 @compute @workgroup_size(${WG}) fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
@@ -251,6 +239,29 @@ fn one(i: u32, dt: f32) -> f32 {
   atomicMax(&wmax, bitcast<u32>(v2));
   workgroupBarrier();
   if (li == 0u) { atomicMax(&st.vacc, atomicLoad(&wmax)); }
+}`],
+
+    // single cell grid, rebuilt every step: clear the cells particles were in, then re-insert
+    gclear: [['P', 'st', 'pm', 'gcnt'], /* wgsl */`
+@compute @workgroup_size(${WG}) fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= P.n || st.dt == 0.0) { return; }
+  let old = bitcast<i32>(pm[i].z);
+  if (old >= 0) { atomicStore(&gcnt[u32(old)], 0u); }
+}`],
+
+    ginsert: [['P', 'st', 'pv', 'pm', 'gcnt', 'gslot'], /* wgsl */`
+@compute @workgroup_size(${WG}) fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= P.n || st.dt == 0.0) { return; }
+  let m = pm[i];
+  if ((m.w & ALIVE) == 0u) { pm[i].z = NONE; return; }
+  let p = pv[i];
+  let c = i32(p.x - P.gx0) + i32(p.y - P.gy0) * i32(P.gw);
+  let slot = atomicAdd(&gcnt[u32(c)], 1u);
+  if (slot < K) { gslot[u32(c) * K + slot] = i; }
+  pm[i].z = bitcast<u32>(c);
+  pm[i].w = select(m.w & ~INGRID, m.w | INGRID, slot < K);
 }`],
 
     det1: [['P', 'st', 'pa', 'pm', 'expl', 'mt'], /* wgsl */`
@@ -275,7 +286,6 @@ fn one(i: u32, dt: f32) -> f32 {
   if ((mj.w & ALIVE) == 0u) { return; }
   let pj = pv[j];
   let now = st.time;
-  let g = (1u - st.cur) * P.cells;
   let ci = i32(pj.x - P.gx0); let cj = i32(pj.y - P.gy0);
   let detSpeed = mt[CN + 8u]; let R = mt[CN + 9u]; let J = mt[CN + 10u];
   let isExp = mt[MEXP + (mj.w & 255u)] != 0.0;
@@ -286,7 +296,7 @@ fn one(i: u32, dt: f32) -> f32 {
     for (var dx = -3; dx <= 3; dx++) {
       let X = ci + dx; let Y = cj + dy;
       if (X < 0 || Y < 0 || X >= i32(P.gw) || Y >= i32(P.gh)) { continue; }
-      let cc = g + u32(X + Y * i32(P.gw));
+      let cc = u32(X + Y * i32(P.gw));
       let cnt = min(atomicLoad(&gcnt[cc]), K);
       for (var s = 0u; s < cnt; s++) {
         let i = gslot[cc * K + s];
@@ -329,13 +339,13 @@ fn one(i: u32, dt: f32) -> f32 {
 
     pack: [['P', 'pv', 'pa', 'pm', 'rb'], /* wgsl */`
 @compute @workgroup_size(${WG}) fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let i = gid.x;
+  let i = gid.x + P.lo;
   if (i >= P.n) { return; }
   let p = pv[i];
   let a = pa[i];
   var h = a.z;
   if ((pm[i].w & ALIVE) == 0u) { h = -1.0; }
-  rb[i] = vec4<u32>(bitcast<u32>(p.x), bitcast<u32>(p.y), pack2x16float(p.zw), pack2x16float(vec2<f32>(h, a.w)));
+  rb[i - P.lo] = vec4<u32>(bitcast<u32>(p.x), bitcast<u32>(p.y), pack2x16float(p.zw), pack2x16float(vec2<f32>(h, a.w)));
 }`],
   };
 
@@ -351,10 +361,11 @@ fn one(i: u32, dt: f32) -> f32 {
     return F16;
   }
 
-  class GpuSim {
-    static available() { return !!(G.navigator && navigator.gpu); }
-
-    static async create() {
+  // one device shared by the simulation and the renderer, so particles never leave the GPU
+  let devicePromise = null;
+  function getGpuDevice() {
+    if (devicePromise) return devicePromise;
+    devicePromise = (async () => {
       const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
       if (!adapter) throw new Error('no WebGPU adapter available');
       const L = adapter.limits;
@@ -366,7 +377,20 @@ fn one(i: u32, dt: f32) -> f32 {
         },
       });
       const info = adapter.info || {};
-      return new GpuSim(device, [info.vendor, info.architecture].filter(Boolean).join(' ') || 'GPU');
+      device.lost.then((e) => { devicePromise = null; console.error('WebGPU device lost:', e.message); });
+      device.addEventListener('uncapturederror', (e) => console.error('WebGPU:', e.error.message));
+      return { device, label: [info.vendor, info.architecture].filter(Boolean).join(' ') || 'GPU' };
+    })();
+    devicePromise.catch(() => { devicePromise = null; });
+    return devicePromise;
+  }
+
+  class GpuSim {
+    static available() { return !!(G.navigator && navigator.gpu); }
+
+    static async create() {
+      const { device, label } = await getGpuDevice();
+      return new GpuSim(device, label);
     }
 
     constructor(device, label) {
@@ -375,8 +399,8 @@ fn one(i: u32, dt: f32) -> f32 {
       this.events = [];
       this.n = 0; this.nb = 0; this.time = 0; this.gen = 0;
       this.lost = false;
-      device.lost.then((e) => { this.lost = true; console.error('WebGPU device lost:', e.message); });
-      device.addEventListener('uncapturederror', (e) => console.error('WebGPU:', e.error.message));
+      this.readAll = false; // read every particle back (only needed by the 2D fallback renderer)
+      device.lost.then(() => { this.lost = true; });
       this.pipes = {};
       for (const [name, [binds, body]] of Object.entries(KERNELS)) {
         const code = HEADER + binds.map((b, k) => `@group(0) @binding(${k}) ${DECL[b][1]}`).join('\n') + '\n' + body;
@@ -402,24 +426,36 @@ fn one(i: u32, dt: f32) -> f32 {
       this.gen++;
       if (this.bufs) for (const buf of Object.values(this.bufs)) buf.destroy();
 
+      // projectile particles go last, so the stats only need to read back the range [lo, n)
+      const perm = new Int32Array(n);
+      let lo = 0;
+      for (let i = 0; i < n; i++) if (b.grp[i] !== 1) perm[i] = lo++;
+      for (let i = 0, k = lo; i < n; i++) if (b.grp[i] === 1) perm[i] = k++;
+      this.projLo = lo;
+      this.lo = this.readAll ? 0 : lo;
       const pv = new Float32Array(n * 4), pa = new Float32Array(n * 4);
       const pmU = new Uint32Array(n * 4), pmF = new Float32Array(pmU.buffer);
-      for (let i = 0; i < n; i++) {
-        pv[i * 4] = b.px[i]; pv[i * 4 + 1] = b.py[i]; pv[i * 4 + 2] = b.vx[i]; pv[i * 4 + 3] = b.vy[i];
-        pa[i * 4 + 2] = b.heat[i];
-        pmF[i * 4] = b.invm[i];
-        pmF[i * 4 + 1] = b.detT[i] === Infinity ? 1e30 : b.detT[i];
+      const mat = new Uint8Array(n), grp = new Uint8Array(n);
+      for (let o = 0; o < n; o++) {
+        const i = perm[o];
+        pv[i * 4] = b.px[o]; pv[i * 4 + 1] = b.py[o]; pv[i * 4 + 2] = b.vx[o]; pv[i * 4 + 3] = b.vy[o];
+        pa[i * 4 + 2] = b.heat[o];
+        pmF[i * 4] = b.invm[o];
+        pmF[i * 4 + 1] = b.detT[o] === Infinity ? 1e30 : b.detT[o];
         pmU[i * 4 + 2] = NONE;
-        pmU[i * 4 + 3] = b.mat[i] | (b.alive[i] ? ALIVE : 0);
+        pmU[i * 4 + 3] = b.mat[o] | (b.alive[o] ? ALIVE : 0);
+        mat[i] = b.mat[o]; grp[i] = b.grp[o];
       }
       const bondsU = new Uint32Array(nb * 4), bondsF = new Float32Array(bondsU.buffer);
       const adj = new Uint32Array(n * ADJ).fill(NONE);
       const put = (i, e) => { for (let k = 0; k < ADJ; k++) if (adj[i * ADJ + k] === NONE) { adj[i * ADJ + k] = e; return; } };
       for (let k = 0; k < nb; k++) {
-        bondsU[k * 4] = b.ba[k]; bondsU[k * 4 + 1] = b.bb[k];
+        const i = perm[b.ba[k]], j = perm[b.bb[k]];
+        bondsU[k * 4] = i; bondsU[k * 4 + 1] = j;
         bondsF[k * 4 + 2] = b.brest[k]; bondsF[k * 4 + 3] = b.borig[k];
-        put(b.ba[k], k * 2); put(b.bb[k], k * 2 + 1);
+        put(i, k * 2); put(j, k * 2 + 1);
       }
+      const explP = Uint32Array.from(b.expl, (i) => perm[i]);
       const mt = new Float32Array(MT.LEN);
       const P = PHYS;
       [P.MK, P.MY, P.MFR, P.MCR, P.MMELT, P.MCB].forEach((arr, k) => mt.set(arr, k * 16));
@@ -428,7 +464,7 @@ fn one(i: u32, dt: f32) -> f32 {
       mt.set([P.R0, P.HEAT_V, P.HEAT_K, P.PLASTIC_HEAT, P.MIN_REST, P.BREAK_HEAT, P.FRICTION,
         P.DET_HEAT, P.DET_SPEED, P.BLAST_R, P.BLAST_J], MT.CONST);
       const params = new ArrayBuffer(64), pu = new Uint32Array(params), pf = new Float32Array(params);
-      pu.set([n, nb, nexpl, b.gw, b.gh, cells, P.NM, 0]);
+      pu.set([n, nb, nexpl, b.gw, b.gh, cells, P.NM, this.lo]);
       pf.set([b.bx0 - 1, b.by0 - 1, b.bx0, b.by0, b.bx1, b.by1, b.dtStab, 0], 8);
       const state = new ArrayBuffer(STATE_SIZE), su = new Uint32Array(state);
       su[4] = new Uint32Array(new Float32Array([b.vmax * b.vmax]).buffer)[0];
@@ -447,16 +483,16 @@ fn one(i: u32, dt: f32) -> f32 {
         adj: mk(adj, ST),
         bonds: mk(nb ? bondsU : null, ST, nb * 16),
         bout: mk(null, ST, nb * 16),
-        gcnt: mk(null, ST, 2 * cells * 4),
-        gslot: mk(null, ST, 2 * cells * K * 4),
+        gcnt: mk(null, ST, cells * 4),
+        gslot: mk(null, ST, cells * K * 4),
         mt: mk(mt, ST),
-        expl: mk(nexpl ? Uint32Array.from(b.expl) : null, ST, nexpl * 4),
+        expl: mk(nexpl ? explP : null, ST, nexpl * 4),
         ev: mk(null, ST | S.COPY_SRC, EVCAP * 16),
-        rb: mk(null, ST | S.COPY_SRC, n * 16),
+        rb: mk(null, ST | S.COPY_SRC, (n - this.lo) * 16),
       };
       this.evOff = STATE_SIZE;
       this.rbOff = STATE_SIZE + EVCAP * 16;
-      this.bufs.staging = dev.createBuffer({ size: this.rbOff + n * 16, usage: S.MAP_READ | S.COPY_DST });
+      this.bufs.staging = dev.createBuffer({ size: this.rbOff + (n - this.lo) * 16, usage: S.MAP_READ | S.COPY_DST });
       this.groups = {};
       for (const [name, p] of Object.entries(this.pipes)) {
         this.groups[name] = dev.createBindGroup({
@@ -471,12 +507,13 @@ fn one(i: u32, dt: f32) -> f32 {
       dev.queue.submit([enc.finish()]);
 
       this.n = n; this.nb0 = nb; this.nb = nb; this.nexpl = nexpl;
-      this.mat = b.mat.slice(0, n); this.grp = b.grp.slice(0, n);
-      this.px = Float32Array.from(b.px.subarray(0, n)); this.py = Float32Array.from(b.py.subarray(0, n));
-      this.vx = Float32Array.from(b.vx.subarray(0, n)); this.vy = Float32Array.from(b.vy.subarray(0, n));
-      this.heat = Float32Array.from(b.heat.subarray(0, n)); this.stress = new Float32Array(n);
-      this.alive = b.alive.slice(0, n);
+      this.mat = mat; this.grp = grp;
+      const pick = (src) => { const a = new Float32Array(n); for (let o = 0; o < n; o++) a[perm[o]] = src[o]; return a; };
+      this.px = pick(b.px); this.py = pick(b.py); this.vx = pick(b.vx); this.vy = pick(b.vy);
+      this.heat = pick(b.heat); this.stress = new Float32Array(n);
+      this.alive = new Uint8Array(n).fill(1);
       this.time = 0; this.steps = 0; this.events = [];
+      this.msPerStep = Math.max(0.05, n * 2e-5); // rough first guess; refined from measurements
     }
 
     dispatch(pass, name, count) {
@@ -496,7 +533,11 @@ fn one(i: u32, dt: f32) -> f32 {
       const dev = this.device, gen = this.gen, bufs = this.bufs;
       const remaining = us / this.usPerT;
       const dtEst = Math.min(this.dtStab, 0.15 / Math.max(1e-6, this.vmax));
-      const nSteps = Math.max(1, Math.min(maxSteps, Math.ceil(remaining / dtEst * 1.02) + 1));
+      // Keep each submission short (~40 ms of GPU work): long batches stall the UI and can trip the
+      // OS GPU watchdog (Windows resets the driver after ~2 s), which matters at fine resolutions.
+      const budget = Math.max(2, Math.floor(BATCH_MS / this.msPerStep));
+      const nSteps = Math.max(1, Math.min(maxSteps, budget, Math.ceil(remaining / dtEst * 1.02) + 1));
+      const t0 = performance.now();
       dev.queue.writeBuffer(bufs.st, 12, new Float32Array([remaining]));
       dev.queue.writeBuffer(bufs.st, 36, new Uint32Array([0]));
       const enc = dev.createCommandEncoder();
@@ -509,18 +550,21 @@ fn one(i: u32, dt: f32) -> f32 {
         this.dispatch(pass, 'contacts', n);
         this.dispatch(pass, 'bonds', nb);
         this.dispatch(pass, 'integrate', n);
+        this.dispatch(pass, 'gclear', n);
+        this.dispatch(pass, 'ginsert', n);
         if (nexpl) {
           this.dispatch(pass, 'det1', nexpl);
           this.dispatch(pass, 'det2', n);
           this.dispatch(pass, 'det3', nexpl);
         }
       }
-      this.dispatch(pass, 'pack', n);
+      const lo = this.lo;
+      this.dispatch(pass, 'pack', n - lo);
       pass.end();
       const stg = bufs.staging;
       enc.copyBufferToBuffer(bufs.st, 0, stg, 0, STATE_SIZE);
       enc.copyBufferToBuffer(bufs.ev, 0, stg, this.evOff, EVCAP * 16);
-      enc.copyBufferToBuffer(bufs.rb, 0, stg, this.rbOff, n * 16);
+      if (n > lo) enc.copyBufferToBuffer(bufs.rb, 0, stg, this.rbOff, (n - lo) * 16);
       dev.queue.submit([enc.finish()]);
       try {
         await stg.mapAsync(GPUMapMode.READ);
@@ -538,10 +582,10 @@ fn one(i: u32, dt: f32) -> f32 {
       const nev = Math.min(EVCAP, su[9]);
       const ev = new Float32Array(data, this.evOff, nev * 4);
       for (let k = 0; k < nev; k++) this.events.push({ x: ev[k * 4], y: ev[k * 4 + 1], t: ev[k * 4 + 2] });
-      const rbF = new Float32Array(data, this.rbOff, n * 4), rbU = new Uint32Array(data, this.rbOff, n * 4);
+      const rbF = new Float32Array(data, this.rbOff, (n - lo) * 4), rbU = new Uint32Array(data, this.rbOff, (n - lo) * 4);
       const T = f16Table();
       const { px, py, vx, vy, heat, stress, alive } = this;
-      for (let i = 0, k = 0; i < n; i++, k += 4) {
+      for (let i = lo, k = 0; i < n; i++, k += 4) {
         px[i] = rbF[k]; py[i] = rbF[k + 1];
         const v = rbU[k + 2], hs = rbU[k + 3];
         vx[i] = T[v & 0xffff]; vy[i] = T[v >>> 16];
@@ -550,6 +594,7 @@ fn one(i: u32, dt: f32) -> f32 {
         heat[i] = h; stress[i] = T[hs >>> 16];
       }
       stg.unmap();
+      if (steps > 0) this.msPerStep = Math.max(0.01, this.msPerStep * 0.5 + (performance.now() - t0) / steps * 0.5);
       return { steps, lagging: sf[3] > dtEst * 1e-3 };
     }
 
@@ -557,9 +602,9 @@ fn one(i: u32, dt: f32) -> f32 {
 
     dispose() {
       if (this.bufs) for (const buf of Object.values(this.bufs)) buf.destroy();
-      this.device.destroy();
     }
   }
 
   G.GpuSim = GpuSim;
+  G.getGpuDevice = getGpuDevice;
 })(window);

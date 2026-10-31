@@ -96,11 +96,12 @@
       while (Atomics.load(ctrl, DONE) < nW) { /* spin: the main thread may not Atomics.wait */ }
     }
 
-    advance(us, maxSteps) {
+    advance(us, maxSteps, budgetMs = 30) {
       const X = this.X;
+      const t0 = performance.now();
       let remaining = us / this.usPerT;
       let steps = 0;
-      while (remaining > 1e-9 && steps < maxSteps) {
+      while (remaining > 1e-9 && steps < maxSteps && (steps === 0 || performance.now() - t0 < budgetMs)) {
         const dt = Math.min(this.dtStab, 0.15 / Math.max(1e-6, this.vmax), remaining);
         X.step_begin(dt, Math.exp(-dt / 20));
         this.phase(0);
