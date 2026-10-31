@@ -458,6 +458,13 @@ pub unsafe extern "C" fn step_end() -> f64 {
     sqrt(v2)
 }
 
+#[inline(always)]
+unsafe fn in_grid(s: &State, cc: usize, i: usize) -> bool {
+    let cnt = ((*s.gcnt.add(cc)).load(Relaxed) as usize).min(K);
+    let slots = s.gslot.add(cc * K);
+    (0..cnt).any(|q| *slots.add(q) as usize == i)
+}
+
 unsafe fn contacts(s: &State, lo: usize, hi: usize) {
     let mt = s.mt;
     let r0 = *mt.add(MT_CONST);
@@ -473,7 +480,8 @@ unsafe fn contacts(s: &State, lo: usize, hi: usize) {
             continue;
         }
         let c = *s.pcell.add(i);
-        if c < 0 {
+        if c < 0 || !in_grid(s, g + c as usize, i) {
+            // overflowed its cell: neighbours can't see it, so it must not push them either
             continue;
         }
         let xi = *s.px.add(i);

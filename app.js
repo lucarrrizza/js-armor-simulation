@@ -122,7 +122,7 @@
   const engineSel = $('engine'), threadsSel = $('threads');
   const hwThreads = navigator.hardwareConcurrency || 4;
   for (let t = 1; t <= Math.min(64, hwThreads); t++) threadsSel.add(new Option(String(t), String(t)));
-  threadsSel.value = String(Math.max(1, Math.min(hwThreads - 1, Math.round(hwThreads * 0.7))));
+  threadsSel.value = String(Math.max(1, Math.min(hwThreads - 1, Math.round(hwThreads * 0.5))));
   const engineAvail = { gpu: GpuSim.available(), wasm: WasmSim.available(), js: true };
   const engineWhy = { gpu: 'no WebGPU in this browser', wasm: 'start with: python3 serve.py' };
   for (const o of engineSel.options) {
@@ -449,21 +449,21 @@
   }
 
   let advancing = false;
-  async function loop() {
-    if (running && sim && !advancing) {
-      advancing = true;
-      const t0 = performance.now();
-      try {
-        const r = await sim.advance(usPerFrame(), 300);
-        lagging = r.lagging;
-      } catch (e) {
-        console.error(e);
-        running = false;
-      } finally {
-        advancing = false;
-      }
-      simMs = simMs * 0.9 + (performance.now() - t0) * 0.1;
-    }
+  // Not awaited: the GPU engine resolves asynchronously, so we keep drawing its latest readback
+  // while the next batch of steps runs. CPU engines finish synchronously before render().
+  function startAdvance() {
+    const t0 = performance.now();
+    const done = (r) => { lagging = r.lagging; simMs = simMs * 0.9 + (performance.now() - t0) * 0.1; };
+    const fail = (e) => { console.error(e); running = false; };
+    let r;
+    try { r = sim.advance(usPerFrame(), 300); } catch (e) { fail(e); return; }
+    if (!(r instanceof Promise)) { done(r); return; }
+    advancing = true;
+    r.then(done, fail).finally(() => { advancing = false; });
+  }
+
+  function loop() {
+    if (running && sim && !advancing) startAdvance();
     if (sim) {
       render();
       if (frame % 5 === 0) { lastStats = sim.stats(); updateStats(); }

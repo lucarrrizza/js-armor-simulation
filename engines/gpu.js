@@ -7,7 +7,7 @@
   const { Sim, PHYS } = G.ImpactSim;
   const WG = 128;
   const K = 6, ADJ = 8, NONE = 0xffffffff, EVCAP = 2048;
-  const ALIVE = 256, FIRE = 512;
+  const ALIVE = 256, FIRE = 512, INGRID = 1024;
   const MT = { MK: 0, MY: 16, MFR: 32, MCR: 48, MMELT: 64, MCB: 80, MEXP: 96, KC: 112, CC: 368, CONST: 624, LEN: 640 };
   const STATE_SIZE = 48;
 
@@ -17,6 +17,7 @@ const ADJ: u32 = ${ADJ}u;
 const NONE: u32 = 0xffffffffu;
 const ALIVE: u32 = ${ALIVE}u;
 const FIRE: u32 = ${FIRE}u;
+const INGRID: u32 = ${INGRID}u;
 const EVCAP: u32 = ${EVCAP}u;
 const MK: u32 = ${MT.MK}u; const MY: u32 = ${MT.MY}u; const MFR: u32 = ${MT.MFR}u; const MCR: u32 = ${MT.MCR}u;
 const MMELT: u32 = ${MT.MMELT}u; const MCB: u32 = ${MT.MCB}u; const MEXP: u32 = ${MT.MEXP}u;
@@ -83,6 +84,7 @@ struct State {
   let slot = atomicAdd(&gcnt[u32(c)], 1u);
   if (slot < K) { gslot[u32(c) * K + slot] = i; }
   pm[i].z = bitcast<u32>(c);
+  pm[i].w = select(pm[i].w & ~INGRID, pm[i].w | INGRID, slot < K);
 }`],
 
     contacts: [['P', 'st', 'pv', 'pa', 'pm', 'gcnt', 'gslot', 'mt'], /* wgsl */`
@@ -94,7 +96,9 @@ struct State {
   let m = pm[i];
   if ((m.w & ALIVE) == 0u) { return; }
   let c = bitcast<i32>(m.z);
-  if (c < 0) { return; }
+  // a particle that overflowed its grid cell is invisible to its neighbours, so it must not
+  // push them either: one-sided contacts would act like a rocket on its fragment
+  if (c < 0 || (m.w & INGRID) == 0u) { return; }
   let p = pv[i];
   let mi = (m.w & 255u) * P.nm;
   let g = i32(st.cur * P.cells);
@@ -235,6 +239,7 @@ fn one(i: u32, dt: f32) -> f32 {
   let slot = atomicAdd(&gcnt[cc], 1u);
   if (slot < K) { gslot[cc * K + slot] = i; }
   pm[i].z = bitcast<u32>(c);
+  pm[i].w = select(m.w & ~INGRID, m.w | INGRID, slot < K);
   return v2;
 }
 @compute @workgroup_size(${WG}) fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
@@ -430,7 +435,7 @@ fn one(i: u32, dt: f32) -> f32 {
 
       const S = GPUBufferUsage;
       const mk = (data, usage, size) => {
-        const buf = dev.createBuffer({ size: Math.max(16, Math.ceil((size ?? data.byteLength) / 4) * 4), usage: usage | S.COPY_DST });
+        const buf = dev.createBuffer({ size: Math.max(16, Math.ceil((size ?? data.byteLength) / 4) * 4), usage: usage | S.COPY_DST | S.COPY_SRC });
         if (data) dev.queue.writeBuffer(buf, 0, data);
         return buf;
       };
@@ -496,7 +501,7 @@ fn one(i: u32, dt: f32) -> f32 {
       dev.queue.writeBuffer(bufs.st, 36, new Uint32Array([0]));
       const enc = dev.createCommandEncoder();
       const pass = enc.beginComputePass();
-      const { n, nb, nexpl } = this;
+      const { n, nexpl } = this, nb = this.nb0; // bonds are never compacted on the GPU
       for (let s = 0; s < nSteps; s++) {
         pass.setPipeline(this.pipes.dt.pipeline);
         pass.setBindGroup(0, this.groups.dt);
