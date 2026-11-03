@@ -45,6 +45,12 @@
   #legend div { display:flex; align-items:center; gap:6px; }
   #legend i { width:10px; height:10px; display:inline-block; border-radius:2px; }
   .hint { color:var(--dim); font-size:11.5px; margin-top:10px; }
+  #timeline { position:absolute; left:200px; right:12px; bottom:10px; display:none; align-items:center; gap:8px; background:rgba(20,24,31,.85); border:1px solid var(--line); border-radius:6px; padding:5px 8px; }
+  #timeline.show { display:flex; }
+  #timeline input[type=range] { flex:1; width:auto; }
+  #timeline button { padding:2px 9px; }
+  #timeline.live { opacity:.65; }
+  #timeline .val { min-width:110px; }
   .val { color:var(--accent); font-variant-numeric:tabular-nums; min-width:56px; text-align:right; }
 </style>
 </head>
@@ -53,11 +59,17 @@
   <div id="panel">
     <h1>IMPACT <span>SANDBOX</span></h1>
     <div class="btns">
-      <button class="primary" id="fire">▶ Fire (R)</button>
-      <button id="pause">Pause (Space)</button>
-      <button id="stepBtn">Step</button>
+      <button class="primary" id="pause">▶ Play (Space)</button>
+      <button id="resetBtn" title="Rebuild the scene at t = 0, paused">⟲ Reset (R)</button>
+      <button id="stepBtn">Step (.)</button>
       <button id="fitBtn">Fit view (F)</button>
     </div>
+
+    <h2>Record &amp; replay</h2>
+    <label class="row"><span>Run until t<sub>f</sub> (µs)</span><input type="number" id="recTf" min="1" step="10" value="300"></label>
+    <label class="row"><span>Frames to keep</span><input type="number" id="recFrames" min="2" max="5000" step="10" value="300"></label>
+    <div class="btns"><button id="recBtn">⏺ Run to t<sub>f</sub> &amp; record</button></div>
+    <div id="recInfo" class="hint"></div>
 
     <h2>Playback</h2>
     <label class="row"><span>Slow-mo (µs / frame)</span><input type="range" id="speed" min="-2" max="1.3" step="0.05" value="0.18"><span class="val" id="speedVal"></span></label>
@@ -81,8 +93,11 @@
       <button data-tool="pan" title="V / Esc">✋ Pan</button>
       <button data-tool="brush" title="B">🖌 Brush</button>
       <button data-tool="line" title="L">╱ Line</button>
-      <button data-tool="rect" title="X">▭ Rect</button>
-      <button data-tool="circle" title="C">◯ Circle</button>
+      <button data-tool="rect" title="X">■ Rect fill</button>
+      <button data-tool="rectO" title="Shift+X">□ Rect outline</button>
+      <button data-tool="fill" title="G: fill the enclosed area or the body under the cursor">🪣 Bucket</button>
+      <button data-tool="circle" title="C">● Circle fill</button>
+      <button data-tool="circleO" title="Shift+C">○ Circle outline</button>
       <button data-tool="erase" title="E">⌫ Eraser</button>
     </div>
     <label class="row"><span>Paint as</span>
@@ -92,7 +107,7 @@
         <option value="anchor">Pin (clamp armor in place)</option>
       </select></label>
     <label class="row" id="dMatRow"><span>Material</span><select id="dMat"></select></label>
-    <label class="row"><span>Brush / eraser size (mm)</span><input type="number" id="dSize" min="1" step="1" value="12"></label>
+    <label class="row"><span>Stroke width (mm)</span><input type="number" id="dSize" min="1" step="1" value="12"></label>
     <label class="row dProj"><span>Velocity (m/s)</span><input type="number" id="dV" min="0" step="50" value="1500"></label>
     <label class="row dProj"><span>Direction</span><input type="range" id="dDir" min="-180" max="180" step="5" value="0"><span class="val" id="dDirVal"></span></label>
     <div class="btns"><button id="dUndo">Undo (Ctrl+Z)</button><button id="dClear">Clear drawing</button></div>
@@ -131,8 +146,8 @@
 
     <div class="hint">
       Mouse wheel: zoom · Drag: pan (right / middle drag while drawing) · Double-click: fit<br>
-      Draw tools: B brush · L line · X rect · C circle · E eraser · V pan · Ctrl+Z undo<br>
-      Space: pause · R: fire again · F: fit · . : single step<br><br>
+      Draw tools: B brush · L line · X rect (Shift+X outline) · C circle (Shift+C outline) · G bucket · E eraser · V pan · Ctrl+Z undo<br>
+      Space: play / pause · R: reset · F: fit · . / , : step (frame forward / back in replay)<br><br>
       2D cross-section through the line of fire. Each particle is a chunk of material linked
       to its neighbours by bonds that bend plastically, heat up and break. It's a toy model,
       tuned to look and behave plausibly, not a validated ballistic code.
@@ -143,6 +158,12 @@
     <canvas id="view"></canvas>
     <div id="legend"></div>
     <div id="stats"></div>
+    <div id="timeline">
+      <button id="tlPlay" title="Play / pause the replay (Space)">▶</button>
+      <input type="range" id="tlSlider" min="0" max="1" step="1" value="0">
+      <span id="tlTime" class="val"></span>
+      <button id="tlLive" title="Leave the replay and reset the live simulation (R)">Live</button>
+    </div>
   </div>
 </div>
 <script src="sim.js"></script>

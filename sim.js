@@ -140,9 +140,12 @@
 
   // ---- user drawings ----
   // Shapes are stored in world millimetres (independent of resolution):
-  //   { kind: 'brush'|'line'|'rect'|'circle', role: 'armor'|'projectile'|'anchor'|'erase',
-  //     mat, size (stroke width, mm), pts: [[x, y], ...], v (m/s), dir (deg, 0 = +x, counter-clockwise) }
+  //   { kind: 'brush'|'line'|'rect'|'circle'|'fill', role: 'armor'|'projectile'|'anchor'|'erase',
+  //     mat, size (stroke width, mm), outline (rect/circle: only the edge, `size` wide),
+  //     pts: [[x, y], ...] ('fill': the seed point), v (m/s), dir (deg, 0 = +x, counter-clockwise) }
   // They are rasterized onto a global hexagonal lattice, applied in order (later shapes win).
+  // A bucket fill floods the connected region of whatever is under the seed point at that moment
+  // (empty space, or one material) and is re-evaluated at every resolution.
   const LAT_OFF = 1 << 20;
   const latKey = (r, k) => (r + LAT_OFF) * 4194304 + (k + LAT_OFF);
   // x is shifted by a quarter unit so nodes don't sit exactly on the 2D renderer's pixel edges
@@ -160,17 +163,28 @@
         }
       }
     };
-    if (s.kind === 'rect') {
+    const rr = Math.max(0.5, (s.size || 1) / 2 / res);
+    if (s.kind === 'rect' && !s.outline) {
       const [a, b] = P;
       const x0 = Math.min(a[0], b[0]), x1 = Math.max(a[0], b[0]), y0 = Math.min(a[1], b[1]), y1 = Math.max(a[1], b[1]);
       visit(x0, x1, y0, y1, (x, y) => x >= x0 && x <= x1 && y >= y0 && y <= y1);
     } else if (s.kind === 'circle') {
       const [c, e] = P;
       const R = Math.hypot(e[0] - c[0], e[1] - c[1]);
-      visit(c[0] - R, c[0] + R, c[1] - R, c[1] + R, (x, y) => (x - c[0]) ** 2 + (y - c[1]) ** 2 <= R * R);
+      const Ro = s.outline ? R + rr : R, Ri = s.outline ? Math.max(0, R - rr) : -1;
+      visit(c[0] - Ro, c[0] + Ro, c[1] - Ro, c[1] + Ro, (x, y) => {
+        const d2 = (x - c[0]) ** 2 + (y - c[1]) ** 2;
+        return d2 <= Ro * Ro && d2 >= Ri * Ri;
+      });
     } else {
-      const rr = Math.max(0.5, s.size / 2 / res);
-      const segs = P.length === 1 ? [[P[0], P[0]]] : P.slice(1).map((p, i) => [P[i], p]);
+      let segs;
+      if (s.kind === 'rect') { // outline: the four edges as strokes
+        const [a, b] = P;
+        const q = [a, [b[0], a[1]], b, [a[0], b[1]], a];
+        segs = q.slice(1).map((p, i) => [q[i], p]);
+      } else {
+        segs = P.length === 1 ? [[P[0], P[0]]] : P.slice(1).map((p, i) => [P[i], p]);
+      }
       for (const [a, b] of segs) {
         const dx = b[0] - a[0], dy = b[1] - a[1], l2 = dx * dx + dy * dy;
         visit(Math.min(a[0], b[0]) - rr, Math.max(a[0], b[0]) + rr, Math.min(a[1], b[1]) - rr, Math.max(a[1], b[1]) + rr, (x, y) => {
@@ -181,22 +195,113 @@
     }
   }
 
-  function rasterizeDrawing(shapes, res) {
-    const cells = new Map(), touched = new Set(), pins = new Set();
-    for (const s of shapes || []) {
-      if (!s.pts || !s.pts.length) continue;
-      if (s.role === 'anchor') { forShapeNodes(s, res, (r, k) => pins.add(latKey(r, k))); continue; }
-      if (s.role === 'erase') {
-        forShapeNodes(s, res, (r, k) => { const key = latKey(r, k); cells.delete(key); touched.add(key); });
+  // Bucket fills work on a dense window of lattice nodes covering everything solid (+ margin).
+  // A node's "colour" is 0 when empty, else 1 + 2 * material + group.
+  const FILL_NEAR = 0.62; // a node belongs to a preset body if a particle is this close (>= hex circumradius)
+  class FillWindow {
+    constructor(x0, x1, y0, y1) {
+      this.R0 = Math.floor(y0 / ROW) - 2; this.K0 = Math.floor(x0) - 2;
+      this.RH = Math.ceil(y1 / ROW) + 3 - this.R0; this.KW = Math.ceil(x1) + 3 - this.K0;
+    }
+    idx(r, k) {
+      const i = r - this.R0, j = k - this.K0;
+      return i < 0 || j < 0 || i >= this.RH || j >= this.KW ? -1 : i * this.KW + j;
+    }
+  }
+  function baseLabels(base, win) {
+    const lab = new Uint16Array(win.RH * win.KW);
+    for (let i = 0; i < base.x.length; i++) {
+      const x = base.x[i], y = base.y[i], r0 = Math.round(y / ROW);
+      const c = 1 + 2 * base.mat[i] + base.grp[i];
+      for (let r = r0 - 1; r <= r0 + 1; r++) {
+        const o = (r & 1 ? 0.5 : 0) + LAT_X, k0 = Math.round(x - o), ny = r * ROW;
+        for (let k = k0 - 1; k <= k0 + 1; k++) {
+          const nx = k + o;
+          if ((nx - x) ** 2 + (ny - y) ** 2 > FILL_NEAR * FILL_NEAR) continue;
+          const w = win.idx(r, k);
+          if (w >= 0 && !lab[w]) lab[w] = c;
+        }
+      }
+    }
+    return lab;
+  }
+
+  // flood the region under the seed: flat [r, k, ...] list, or null if it is open space reaching
+  // the edge of the window (it would fill the whole world)
+  function floodRegion(seed, res, win, label) {
+    const sy = seed[1] / res, r0 = Math.round(sy / ROW);
+    const k0 = Math.round(seed[0] / res - (r0 & 1 ? 0.5 : 0) - LAT_X);
+    const w0 = win.idx(r0, k0);
+    if (w0 < 0) return null;
+    const target = label(r0, k0, w0);
+    const seen = new Uint8Array(win.RH * win.KW);
+    const q = [w0];
+    seen[w0] = 1;
+    for (let h = 0; h < q.length; h++) {
+      const w = q[h], i = (w / win.KW) | 0, j = w - i * win.KW;
+      if (i === 0 || j === 0 || i === win.RH - 1 || j === win.KW - 1) {
+        if (target === 0) return null;
         continue;
+      }
+      const r = i + win.R0, k = j + win.K0;
+      const d = r & 1 ? 0 : -1; // diagonal neighbours sit half a column left (even rows) or right (odd rows)
+      const up = w - win.KW + d, dn = w + win.KW + d;
+      for (const [nw, nr, nk] of [[w - 1, r, k - 1], [w + 1, r, k + 1], [up, r - 1, k + d], [up + 1, r - 1, k + d + 1],
+        [dn, r + 1, k + d], [dn + 1, r + 1, k + d + 1]]) {
+        if (seen[nw] || label(nr, nk, nw) !== target) continue;
+        seen[nw] = 1;
+        q.push(nw);
+      }
+    }
+    const out = new Int32Array(q.length * 2);
+    q.forEach((w, n) => { const i = (w / win.KW) | 0; out[2 * n] = i + win.R0; out[2 * n + 1] = w - i * win.KW + win.K0; });
+    return out;
+  }
+
+  // base: the preset particles ({ x, y, mat, grp } arrays, lattice units), needed by bucket fills
+  function rasterizeDrawing(shapes, res, base) {
+    const cells = new Map(), touched = new Set(), pins = new Set();
+    const fillFailed = [];
+    let win = null, baseLab = null;
+    (shapes || []).forEach((s, si) => {
+      if (!s.pts || !s.pts.length) return;
+      let nodes = (fn) => forShapeNodes(s, res, fn);
+      if (s.kind === 'fill') {
+        // the window covers everything solid so far; empty space touching its edge is open
+        let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+        const grow = (x, y) => { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; };
+        if (base) for (let i = 0; i < base.x.length; i++) grow(base.x[i], base.y[i]);
+        for (const c of cells.values()) grow(c.k, c.r * ROW);
+        if (!(x1 >= x0)) { fillFailed.push(si); return; }
+        if (!win || win.R0 > Math.floor(y0 / ROW) - 2 || win.K0 > Math.floor(x0) - 2 ||
+          win.R0 + win.RH < Math.ceil(y1 / ROW) + 3 || win.K0 + win.KW < Math.ceil(x1) + 3) {
+          win = new FillWindow(x0, x1, y0, y1);
+          baseLab = baseLabels(base || { x: [] }, win);
+        }
+        const label = (r, k, w) => {
+          if (!touched.size) return baseLab[w];
+          const key = latKey(r, k);
+          const c = cells.get(key);
+          if (c) return 1 + 2 * c.mat + c.grp;
+          return touched.has(key) ? 0 : baseLab[w];
+        };
+        const region = floodRegion(s.pts[0], res, win, label);
+        if (!region) { fillFailed.push(si); return; }
+        nodes = (fn) => { for (let i = 0; i < region.length; i += 2) fn(region[i], region[i + 1]); };
+      }
+      if (s.role === 'anchor') { nodes((r, k) => pins.add(latKey(r, k))); return; }
+      if (s.role === 'erase') {
+        nodes((r, k) => { const key = latKey(r, k); cells.delete(key); touched.add(key); });
+        return;
       }
       const mat = (MAT_BY_ID[s.mat] || MAT_BY_ID.rha).index;
       const proj = s.role === 'projectile';
       const a = (s.dir || 0) * Math.PI / 180, v = proj ? (s.v || 0) / 100 : 0;
       const entry = { mat, grp: proj ? 1 : 0, vx: v * Math.cos(a), vy: -v * Math.sin(a),
         body: `${s.role}|${s.mat}|${proj ? s.v + '|' + s.dir : ''}` };
-      forShapeNodes(s, res, (r, k) => { const key = latKey(r, k); cells.set(key, Object.assign({ r, k }, entry)); touched.add(key); });
-    }
+      const { grp, vx, vy, body } = entry;
+      nodes((r, k) => { const key = latKey(r, k); cells.set(key, { r, k, mat, grp, vx, vy, body }); touched.add(key); });
+    });
     // true if any drawn/erased lattice node lies within contact range of (x, y)
     const near = (set, x, y, rad) => {
       if (!set.size) return false;
@@ -211,7 +316,7 @@
       }
       return false;
     };
-    return { cells, touched: (x, y) => near(touched, x, y, 0.9), pinned: (x, y) => near(pins, x, y, 0.75) };
+    return { cells, fillFailed, touched: (x, y) => near(touched, x, y, 0.9), pinned: (x, y) => near(pins, x, y, 0.75) };
   }
 
   class Sim {
@@ -305,8 +410,10 @@
       this.entryX = this.armorFront / Math.max(0.05, cs);
 
       // ---- user drawing: replaces / erases base material, adds new bodies ----
+      this.fillFailed = [];
       if (scn.drawn && scn.drawn.length) {
-        const ras = rasterizeDrawing(scn.drawn, res);
+        const ras = rasterizeDrawing(scn.drawn, res, T);
+        this.fillFailed = ras.fillFailed;
         const keep = [];
         for (let i = 0; i < T.x.length; i++) {
           if (ras.touched(T.x[i], T.y[i])) continue;

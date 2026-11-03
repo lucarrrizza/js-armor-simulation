@@ -110,11 +110,13 @@
   function rebuild(keepCamera) {
     if (!engineReady) return;
     scenario = scenarioFromUI();
+    buildGen++;
+    if (rec) stopRecording('the scene was rebuilt');
+    if (replay && !keepReplay && replay.key !== JSON.stringify(scenario)) discardReplay();
     sim = engineObj || new Sim();
-    // the GPU engine only reads every particle back when the 2D canvas renderer needs them
-    if (engineKind === 'gpu') sim.readAll = !gpuRendering();
-    running = false;
-    $('pause').textContent = 'Play (Space)';
+    // the GPU engine only reads every particle back when the 2D canvas renderer (or the recorder) needs them
+    if (engineKind === 'gpu') sim.readAll = !gpuRendering() || recStarting;
+    setRunning(false);
     try {
       sim.build(scenario);
     } catch (e) {
@@ -132,6 +134,7 @@
     if (keepCamera !== true) fitView();
     buildLegend();
     lastStats = sim.stats();
+    if (replay && replayMode) showFrame(replay.idx, true);
   }
 
   // ---------- engines ----------
@@ -158,7 +161,7 @@
   }
 
   async function selectEngine(kind) {
-    running = false;
+    setRunning(false);
     engineReady = false;
     $('engineInfo').textContent = 'starting engine…';
     let msg = '';
@@ -188,38 +191,282 @@
     return engineAvail.gpu ? 'gpu' : engineAvail.wasm ? 'wasm' : 'js';
   }
 
-  function fire() {
+  // Reset rebuilds the scene at t = 0 and stays paused (and leaves the replay, which is kept)
+  function resetScene() {
     if (!engineReady) return;
+    if (rec) stopRecording('cancelled');
+    leaveReplay();
     const cam0 = Object.assign({}, cam);
     rebuild(true);
     Object.assign(cam, cam0);
-    running = true;
-    $('pause').textContent = 'Pause (Space)';
   }
 
-  $('fire').onclick = fire;
+  function setRunning(v) {
+    running = v;
+    updatePlayLabel();
+  }
+  function updatePlayLabel() {
+    const on = replayMode ? replayPlaying : running;
+    $('pause').textContent = on ? '⏸ Pause (Space)' : '▶ Play (Space)';
+    $('tlPlay').textContent = replayPlaying ? '⏸' : '▶';
+  }
+
+  $('resetBtn').onclick = resetScene;
   $('pause').onclick = togglePause;
-  $('stepBtn').onclick = () => {
-    running = false; $('pause').textContent = 'Play (Space)';
+  $('stepBtn').onclick = stepForward;
+  $('fitBtn').onclick = fitView;
+  function togglePause() {
+    if (rec) return;
+    if (replayMode) { toggleReplayPlay(); return; }
+    setRunning(!running);
+  }
+  function stepForward() {
+    if (rec) return;
+    if (replayMode) { replayPlaying = false; seekFrame(replay.idx + 1); return; }
+    setRunning(false);
     if (!sim || advancing) return;
     advancing = true;
     Promise.resolve(sim.advance(usPerFrame(), 400)).finally(() => { advancing = false; });
-  };
-  $('fitBtn').onclick = fitView;
-  function togglePause() { running = !running; $('pause').textContent = running ? 'Pause (Space)' : 'Play (Space)'; }
+  }
 
   window.addEventListener('keydown', (e) => {
-    if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+    if (e.target.tagName === 'SELECT' || (e.target.tagName === 'INPUT' && e.target.type !== 'range' && e.target.type !== 'checkbox')) return;
     if ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z')) { e.preventDefault(); undo(); return; }
     if (e.ctrlKey || e.metaKey || e.altKey) return;
-    const toolKeys = { b: 'brush', l: 'line', x: 'rect', c: 'circle', e: 'erase', v: 'pan' };
-    if (toolKeys[e.key.toLowerCase()]) { setTool(toolKeys[e.key.toLowerCase()]); return; }
+    if (e.target.type === 'range' && e.key.startsWith('Arrow')) return;
+    const k = e.key.toLowerCase();
+    const toolKeys = { b: 'brush', l: 'line', x: e.shiftKey ? 'rectO' : 'rect', c: e.shiftKey ? 'circleO' : 'circle', g: 'fill', e: 'erase', v: 'pan' };
+    if (toolKeys[k]) { setTool(toolKeys[k]); return; }
     if (e.key === 'Escape') { if (drawing) drawing = null; else setTool('pan'); return; }
     if (e.code === 'Space') { e.preventDefault(); togglePause(); }
-    else if (e.key === 'r' || e.key === 'R') fire();
-    else if (e.key === 'f' || e.key === 'F') fitView();
-    else if (e.key === '.') $('stepBtn').onclick();
+    else if (k === 'r') resetScene();
+    else if (k === 'f') fitView();
+    else if (e.key === '.' || (replayMode && e.key === 'ArrowRight')) { e.preventDefault(); stepForward(); }
+    else if (replayMode && (e.key === ',' || e.key === 'ArrowLeft')) { e.preventDefault(); replayPlaying = false; seekFrame(replay.idx - 1); }
   });
+
+  // ---------- record & replay ----------
+  // "Run to tf" simulates up to tf and keeps evenly spaced snapshots. Snapshots are quantised to
+  // ~11 bytes per particle (positions to 1/65535 of the box, velocities to 1/32767 of the frame's
+  // fastest particle), so replays are engine independent and scrubbing is instant.
+  const REC_BYTES = 8e8;
+  let buildGen = 0, recStarting = false, keepReplay = false;
+  let rec = null;      // recording in progress
+  let replay = null;   // finished recording: { key, frames, idx, view }
+  let replayMode = false, replayPlaying = false, replayUs = 0;
+
+  function encodeFrame(s, evs) {
+    const n = s.n, buf = new ArrayBuffer(n * 11);
+    const X = new Uint16Array(buf, 0, n), Y = new Uint16Array(buf, 2 * n, n);
+    const VX = new Int16Array(buf, 4 * n, n), VY = new Int16Array(buf, 6 * n, n);
+    const H = new Uint8Array(buf, 8 * n, n), S = new Uint8Array(buf, 9 * n, n), M = new Uint8Array(buf, 10 * n, n);
+    const { px, py, vx, vy, heat, stress, mat, alive } = s;
+    const x0 = s.bx0 - 1, y0 = s.by0 - 1, sx = 65535 / (s.bx1 - s.bx0 + 2), sy = 65535 / (s.by1 - s.by0 + 2);
+    let vm = 1e-6;
+    for (let i = 0; i < n; i++) if (alive[i]) vm = Math.max(vm, Math.abs(vx[i]), Math.abs(vy[i]));
+    const vs = 32767 / vm;
+    const q16 = (v) => (v > 0 ? (v < 65535 ? Math.round(v) : 65535) : 0);
+    for (let i = 0; i < n; i++) {
+      M[i] = mat[i];
+      if (!alive[i]) { S[i] = 255; continue; }
+      X[i] = q16((px[i] - x0) * sx); Y[i] = q16((py[i] - y0) * sy);
+      VX[i] = Math.round(vx[i] * vs) || 0; VY[i] = Math.round(vy[i] * vs) || 0;
+      H[i] = Math.min(255, Math.max(0, Math.round(heat[i] * 100)));
+      S[i] = Math.min(254, Math.max(0, Math.round(stress[i] * 254)));
+    }
+    return { t: s.time, n, buf, vm, stats: s.stats(), events: evs };
+  }
+
+  function decodeFrame(f, v) {
+    const n = f.n, buf = f.buf;
+    const X = new Uint16Array(buf, 0, n), Y = new Uint16Array(buf, 2 * n, n);
+    const VX = new Int16Array(buf, 4 * n, n), VY = new Int16Array(buf, 6 * n, n);
+    const H = new Uint8Array(buf, 8 * n, n), S = new Uint8Array(buf, 9 * n, n), M = new Uint8Array(buf, 10 * n, n);
+    const x0 = v.bx0 - 1, y0 = v.by0 - 1, sx = (v.bx1 - v.bx0 + 2) / 65535, sy = (v.by1 - v.by0 + 2) / 65535, vs = f.vm / 32767;
+    for (let i = 0; i < n; i++) {
+      v.mat[i] = M[i];
+      const st = S[i];
+      v.alive[i] = st === 255 ? 0 : 1;
+      v.px[i] = x0 + X[i] * sx; v.py[i] = y0 + Y[i] * sy;
+      v.vx[i] = VX[i] * vs; v.vy[i] = VY[i] * vs;
+      v.heat[i] = H[i] / 100; v.stress[i] = st === 255 ? 0 : st / 254;
+    }
+    v.n = n; v.time = f.t;
+  }
+
+  // a stand-in for the simulation object that the renderers draw while replaying
+  function makeView(s, nMax) {
+    const v = { n: 0, time: 0, events: [], replay: true };
+    for (const k of ['res', 'usPerT', 'bx0', 'bx1', 'by0', 'by1', 'losThickness', 'stackLos']) v[k] = s[k];
+    v.fit = Object.assign({}, s.fit);
+    for (const k of ['px', 'py', 'vx', 'vy', 'heat', 'stress']) v[k] = new Float32Array(nMax);
+    v.mat = new Uint8Array(nMax); v.alive = new Uint8Array(nMax);
+    return v;
+  }
+
+  function recordButton() {
+    $('recBtn').innerHTML = rec ? '■ Cancel recording' : '⏺ Run to t<sub>f</sub> &amp; record';
+    $('recBtn').classList.toggle('primary', !!rec);
+  }
+
+  function startRecording() {
+    if (!engineReady) return;
+    if (rec) { stopRecording('cancelled'); return; }
+    leaveReplay();
+    discardReplay();
+    recStarting = true;
+    const cam0 = Object.assign({}, cam);
+    try { rebuild(true); } finally { recStarting = false; }
+    Object.assign(cam, cam0);
+    if (!sim) return;
+    const tf = Math.max(1, +$('recTf').value || 300);
+    let frames = Math.max(2, Math.min(5000, Math.round(+$('recFrames').value || 300)));
+    const perFrame = sim.n * 11 + 256;
+    const maxFrames = Math.floor(REC_BYTES / perFrame);
+    let note = '';
+    if (maxFrames < 2) { $('recInfo').textContent = 'Too many particles to record; try a coarser resolution.'; return; }
+    if (frames > maxFrames) {
+      note = ` (limited to ${maxFrames} frames: ~${(perFrame / 1e6).toFixed(1)} MB each at this resolution)`;
+      frames = maxFrames;
+    }
+    rec = { key: JSON.stringify(scenario), tf, N: frames, frames: [], gen: buildGen, lastEvT: -1, evs: [], note, bytes: 0, nMax: sim.n, t0: performance.now() };
+    rec.view = makeView(sim, sim.n);
+    captureFrame();
+    recordButton();
+  }
+
+  function captureFrame() {
+    const f = encodeFrame(sim, rec.evs);
+    rec.evs = [];
+    rec.frames.push(f);
+    rec.bytes += f.buf.byteLength;
+    $('recInfo').textContent = `Recording… frame ${rec.frames.length}/${rec.N} · t = ${(sim.time * sim.usPerT).toFixed(1)} µs${rec.note}`;
+    if (rec.frames.length >= rec.N) stopRecording();
+  }
+
+  function collectEvents() {
+    let last = rec.lastEvT;
+    for (const e of sim.events) if (e.t > rec.lastEvT) { rec.evs.push({ x: e.x, y: e.y, t: e.t }); last = Math.max(last, e.t); }
+    rec.lastEvT = last;
+  }
+
+  function recordStep() {
+    const k = rec.frames.length;
+    const target = rec.tf * k / (rec.N - 1) / sim.usPerT;
+    const r0 = rec, gen = buildGen;
+    const done = (r) => {
+      if (rec !== r0 || gen !== buildGen) return;
+      collectEvents();
+      if (!r.lagging) captureFrame();
+    };
+    const fail = (e) => { console.error(e); if (rec === r0) stopRecording('the engine failed'); };
+    let r;
+    try { r = sim.advance(Math.max(0, (target - sim.time) * sim.usPerT), 1e7); } catch (e) { fail(e); return; }
+    if (!(r instanceof Promise)) { done(r); return; }
+    advancing = true;
+    r.then(done, fail).finally(() => { advancing = false; });
+  }
+
+  // finish (why undefined) or abort a recording; partial recordings with 2+ frames are kept
+  function stopRecording(why) {
+    const r = rec;
+    rec = null;
+    recordButton();
+    if (r.frames.length < 2) { $('recInfo').textContent = why ? `Recording ${why}.` : ''; return; }
+    const mb = (r.bytes / 1e6).toFixed(0);
+    const tEnd = r.frames[r.frames.length - 1].t * r.view.usPerT;
+    replay = { key: r.key, frames: r.frames, idx: 0, view: r.view };
+    $('recInfo').textContent = (why ? `Recording ${why}; kept ` : 'Recorded ') +
+      `${r.frames.length} frames to t = ${tEnd.toFixed(1)} µs (${mb} MB, ${((performance.now() - r.t0) / 1000).toFixed(1)} s)${r.note}. ` +
+      'Space plays the replay, drag the timeline to scrub, "Live" returns to the simulation.';
+    const tl = $('tlSlider');
+    tl.max = String(r.frames.length - 1);
+    $('timeline').classList.add('show');
+    $('timeline').classList.toggle('live', !replayMode);
+    if (!why) { enterReplay(); seekFrame(0); replayPlaying = true; updatePlayLabel(); }
+  }
+
+  function discardReplay() {
+    if (!replay) return;
+    leaveReplay();
+    replay = null;
+    $('timeline').classList.remove('show');
+    $('recInfo').textContent = 'The scene changed, so the recording was discarded.';
+  }
+
+  function enterReplay() {
+    if (!replay || replayMode) return;
+    setRunning(false);
+    replayMode = true;
+    replayPlaying = false;
+    $('timeline').classList.remove('live');
+    showFrame(replay.idx, true);
+  }
+
+  function leaveReplay() {
+    if (!replayMode) return;
+    replayMode = false;
+    replayPlaying = false;
+    $('timeline').classList.add('live');
+    if (renderer) renderer.reset();
+    if (sim) { lastFxUs = sim.time * sim.usPerT; lastStats = sim.stats(); }
+    updatePlayLabel();
+  }
+
+  function frameUs(i) { return replay.frames[i].t * replay.view.usPerT; }
+
+  // jump: a seek (reset effects and replay only the recent explosions) rather than sequential playback
+  function showFrame(i, jump) {
+    const fr = replay.frames, v = replay.view;
+    i = Math.max(0, Math.min(fr.length - 1, i));
+    const prev = replay.idx;
+    if (jump || i < prev || i > prev + 8) {
+      v.events = [];
+      const tNow = fr[i].t;
+      for (let j = i; j >= 0 && (tNow - fr[j].t) * v.usPerT < 30; j--) v.events.push(...fr[j].events);
+      if (renderer) renderer.reset();
+      lastFxUs = tNow * v.usPerT;
+    } else {
+      for (let j = prev + 1; j <= i; j++) v.events.push(...fr[j].events);
+    }
+    replay.idx = i;
+    decodeFrame(fr[i], v);
+    lastStats = fr[i].stats;
+    $('tlSlider').value = String(i);
+    $('tlTime').textContent = `t = ${frameUs(i).toFixed(1)} µs · ${i + 1}/${fr.length}`;
+  }
+
+  function seekFrame(i) {
+    if (!replay) return;
+    enterReplay();
+    showFrame(i, true);
+    replayUs = frameUs(replay.idx);
+    updatePlayLabel();
+  }
+
+  function toggleReplayPlay() {
+    if (!replay) return;
+    enterReplay();
+    replayPlaying = !replayPlaying;
+    if (replayPlaying && replay.idx >= replay.frames.length - 1) seekFrame(0);
+    replayUs = frameUs(replay.idx);
+    updatePlayLabel();
+  }
+
+  function replayTick() {
+    if (!replayPlaying) return;
+    const fr = replay.frames;
+    replayUs += usPerFrame();
+    let i = replay.idx;
+    while (i + 1 < fr.length && frameUs(i + 1) <= replayUs + 1e-6) i++;
+    if (i !== replay.idx) showFrame(i, false);
+    if (i >= fr.length - 1) { replayPlaying = false; updatePlayLabel(); }
+  }
+
+  $('recBtn').onclick = startRecording;
+  $('tlPlay').onclick = toggleReplayPlay;
+  $('tlLive').onclick = leaveReplay;
+  $('tlSlider').addEventListener('input', () => { replayPlaying = false; seekFrame(+$('tlSlider').value); });
 
   // ---------- rendering ----------
   const canvas = $('view');
@@ -415,7 +662,7 @@
     const nice = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000];
     let mm = nice.find((v) => v * mmPx > 80) || 1000;
     const len = mm * mmPx;
-    const x = 16, y = H - 20;
+    const x = 16, y = H - ($('timeline').classList.contains('show') ? 58 : 20);
     ctx.strokeStyle = '#cfd6e2'; ctx.fillStyle = '#cfd6e2'; ctx.lineWidth = 2;
     ctx.beginPath(); ctx.moveTo(x, y - 5); ctx.lineTo(x, y); ctx.lineTo(x + len, y); ctx.lineTo(x + len, y - 5); ctx.stroke();
     ctx.font = '12px system-ui'; ctx.fillText(mm >= 1000 ? mm / 1000 + ' m' : mm + ' mm', x + len + 8, y + 1);
@@ -503,7 +750,7 @@
     const s = lastStats;
     const v0 = refV();
     $('stats').innerHTML =
-      `t = <b>${s.timeUs.toFixed(1)} µs</b>${running ? '' : ' (paused)'}${lagging ? ' <span style="color:#f66">slowed</span>' : ''}<br>` +
+      `t = <b>${s.timeUs.toFixed(1)} µs</b>${sim.replay ? ' (replay)' : rec ? ' (recording)' : running ? '' : ' (paused)'}${lagging ? ' <span style="color:#f66">slowed</span>' : ''}<br>` +
       `impact ${v0.toFixed(0)} m/s · LOS armor ${sim.losThickness.toFixed(0)} mm` +
       (sim.stackLos > sim.losThickness + 1 ? ` (${sim.stackLos.toFixed(0)} incl. gaps)` : '') + '<br>' +
       `deepest point (LOS) <b>${s.depthMm.toFixed(0)} mm</b><br>` +
@@ -518,7 +765,7 @@
   function startAdvance() {
     const t0 = performance.now();
     const done = (r) => { lagging = r.lagging; simMs = simMs * 0.9 + (performance.now() - t0) * 0.1; };
-    const fail = (e) => { console.error(e); running = false; };
+    const fail = (e) => { console.error(e); setRunning(false); };
     let r;
     try { r = sim.advance(usPerFrame(), 300); } catch (e) { fail(e); return; }
     if (!(r instanceof Promise)) { done(r); return; }
@@ -527,10 +774,22 @@
   }
 
   function loop() {
-    if (running && sim && !advancing) startAdvance();
+    if (rec && sim && engineReady && !advancing) recordStep();
+    else if (running && !replayMode && sim && !advancing) startAdvance();
     if (sim) {
-      render();
-      if (frame % 5 === 0) { lastStats = sim.stats(); updateStats(); }
+      if (replayMode && replay) {
+        replayTick();
+        // the render code reads the global `sim`; point it at the replay frame while drawing
+        const live = sim;
+        sim = replay.view;
+        try {
+          render();
+          if (frame % 5 === 0) updateStats();
+        } finally { sim = live; }
+      } else {
+        render();
+        if (frame % 5 === 0) { lastStats = sim.stats(); updateStats(); }
+      }
     }
     frame++;
     const now = performance.now();
@@ -617,12 +876,15 @@
     return [Math.round(wx * sim.res * 10) / 10, Math.round(wy * sim.res * 10) / 10];
   }
 
+  const TOOL_SHAPE = { erase: ['brush'], rectO: ['rect', true], circleO: ['circle', true] };
   function startShape(e) {
     const p = eventMm(e);
     const erase = tool === 'erase';
     const role = erase ? 'erase' : dRole.value;
-    const s = { kind: erase ? 'brush' : tool, role, size: Math.max(0.5, +$('dSize').value || 10), pts: [p] };
-    if (s.kind !== 'brush') s.pts.push(p.slice());
+    const [kind, outline] = TOOL_SHAPE[tool] || [tool];
+    const s = { kind, role, size: Math.max(0.5, +$('dSize').value || 10), pts: [p] };
+    if (outline) s.outline = true;
+    if (kind !== 'brush' && kind !== 'fill') s.pts.push(p.slice());
     if (role === 'armor' || role === 'projectile') s.mat = dMat.value;
     if (role === 'projectile') { s.v = Math.max(0, +$('dV').value || 0); s.dir = +$('dDir').value || 0; }
     return s;
@@ -655,7 +917,15 @@
       if (Math.hypot(b[0] - a[0], b[1] - a[1]) < sim.res) return; // just a click
     }
     drawn.push(s);
-    drawingChanged();
+    if (s.kind !== 'fill') { drawingChanged(); return; }
+    // a bucket fill only works out during the build; keep the recording until we know it changed the scene
+    const trial = () => { keepReplay = true; try { drawingChanged(); } finally { keepReplay = false; } };
+    trial();
+    if (sim && sim.fillFailed && sim.fillFailed.includes(drawn.length - 1)) {
+      drawn.pop();
+      trial();
+      $('dInfo').textContent = 'Bucket: that spot is open space that isn\'t enclosed. Close the area with outlines/lines first, or click on a body to recolour it.';
+    } else if (replay && replay.key !== JSON.stringify(scenario)) discardReplay();
   }
 
   const ROLE_COL = { projectile: [255, 154, 60], anchor: [80, 200, 255], erase: [255, 80, 80] };
@@ -683,7 +953,14 @@
   function drawShape(s, alpha) {
     const c = shapeColor(s).join(',');
     ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-    if (tracePath(s)) {
+    if (s.kind === 'fill') { // bucket seed: a small marker
+      const [x, y] = worldToScreen(s.pts[0][0] / sim.res, s.pts[0][1] / sim.res);
+      ctx.strokeStyle = `rgba(${c},${alpha})`; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.arc(x, y, 5, 0, Math.PI * 2); ctx.moveTo(x - 8, y); ctx.lineTo(x + 8, y); ctx.moveTo(x, y - 8); ctx.lineTo(x, y + 8);
+      ctx.stroke();
+      return;
+    }
+    if (tracePath(s) && !s.outline) {
       ctx.fillStyle = `rgba(${c},${alpha * 0.45})`; ctx.fill();
       ctx.strokeStyle = `rgba(${c},${alpha})`; ctx.lineWidth = 1.5; ctx.stroke();
     } else {
@@ -725,7 +1002,7 @@
     }
     if (sim.time === 0) for (const s of scenario.drawn) if (s.role === 'projectile' && s.v > 0) drawArrow(s);
     if (drawing) drawShape(drawing, 0.9);
-    if (hover && !drawing && (tool === 'brush' || tool === 'erase' || tool === 'line')) {
+    if (hover && !drawing && (tool === 'brush' || tool === 'erase' || tool === 'line' || tool === 'rectO' || tool === 'circleO')) {
       const [x, y] = worldToScreen(hover[0] / sim.res, hover[1] / sim.res);
       const r = Math.max(1, (+$('dSize').value || 10) / 2 / sim.res * cam.scale);
       ctx.strokeStyle = tool === 'erase' ? 'rgba(255,90,90,0.8)' : 'rgba(255,255,255,0.6)';
@@ -739,6 +1016,8 @@
   canvas.addEventListener('contextmenu', (e) => e.preventDefault());
   canvas.addEventListener('mousedown', (e) => {
     if (!sim) return;
+    if (tool !== 'pan' && e.button === 0 && rec) { $('dInfo').textContent = 'Drawing is disabled while recording.'; return; }
+    if (tool === 'fill' && e.button === 0) { finishShape(startShape(e)); return; }
     if (tool !== 'pan' && e.button === 0) { drawing = startShape(e); return; }
     e.preventDefault();
     drag = { x: e.clientX, y: e.clientY, cx: cam.x, cy: cam.y };
