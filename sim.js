@@ -513,6 +513,9 @@
       this.alive = new Uint8Array(n).fill(1);
       this.invm = new Float64Array(n);
       this.heat = new Float32Array(n); this.stress = new Float32Array(n);
+      // signed per-particle pressure: gas products = EOS pressure (>= 0); solids = virial sum
+      // (contact compression +, bond tension -)
+      this.pres = new Float32Array(n);
       this.detT = new Float64Array(n).fill(Infinity);
       this.uav = new Float64Array(n);  // smoothed speed of explosive particles (shock strength), persists across steps
       this.cellOf = new Int32Array(n); this.sorted = new Int32Array(n);
@@ -611,7 +614,7 @@
         for (let k = 0; k < m; k++) out[k] = arr[sorted[k]];
         return out;
       };
-      for (const key of ['px', 'py', 'vx', 'vy', 'mat', 'grp', 'body', 'alive', 'invm', 'heat', 'detT', 'uav']) this[key] = perm(this[key]);
+      for (const key of ['px', 'py', 'vx', 'vy', 'mat', 'grp', 'body', 'alive', 'invm', 'heat', 'detT', 'uav', 'pres']) this[key] = perm(this[key]);
       this.n = m;
       // explosive index list refers to storage positions, so it must be rebuilt after the permutation
       const exNew = [];
@@ -655,7 +658,7 @@
     step(dt) {
       if (this.steps % 64 === 0) { this.buildGrid(); this.reorder(); } else this.buildGrid();
       const n = this.n;
-      this.fx.fill(0, 0, n); this.fy.fill(0, 0, n); this.stress.fill(0, 0, n);
+      this.fx.fill(0, 0, n); this.fy.fill(0, 0, n); this.stress.fill(0, 0, n); this.pres.fill(0, 0, n);
       this.contacts(dt);
       if (this.explosionModel === 'gas') this.sph();
       this.bonds();
@@ -706,6 +709,7 @@
       for (const i of gas) {
         const r = rho[i], t = mat[i];
         pr[i] = pressure(r, t);
+        this.pres[i] = pr[i];
         const c2 = (r >= GRHOC[t] ? GAMMA_HI : GAMMA_LO) * pr[i] / r;
         if (c2 > cmax2) cmax2 = c2;
         if (r < GAS_CUT * GRHO0[t]) alive[i] = 0;
@@ -748,7 +752,7 @@
     }
 
     contacts(dt) {
-      const { px, py, vx, vy, fx, fy, mat, heat, sorted, cellStart, cellOf, gw } = this;
+      const { px, py, vx, vy, fx, fy, mat, heat, sorted, cellStart, cellOf, gw, pres } = this;
       const o1 = 1, o2 = gw - 1, o3 = gw, o4 = gw + 1;
 
       // ---- contacts (half stencil: own cell + E, SW, S, SE) ----
@@ -759,7 +763,7 @@
         if (MGAS[mat[i]]) continue;
         const xi = px[i], yi = py[i], vxi = vx[i], vyi = vy[i], mi = mat[i] * NM;
         const c = cellOf[i];
-        let fxi = 0, fyi = 0, hi = 0;
+        let fxi = 0, fyi = 0, hi = 0, vi = 0;
         for (let q = 0; q < 5; q++) {
           let b, e;
           if (q === 0) { b = a + 1; e = cellStart[c + 1]; }
@@ -791,14 +795,16 @@
             const ex = f * nx - tx, ey = f * ny - ty;
             fxi -= ex; fyi -= ey;
             fx[j] += ex; fy[j] += ey;
+            const vv = f * d;
+            vi += vv; pres[j] += vv;
           }
         }
-        fx[i] += fxi; fy[i] += fyi; heat[i] += hi;
+        fx[i] += fxi; fy[i] += fyi; heat[i] += hi; pres[i] += vi;
       }
     }
 
     bonds() {
-      const { ba, bb, brest, borig, px, py, vx, vy, fx, fy, mat, alive, heat, stress } = this;
+      const { ba, bb, brest, borig, px, py, vx, vy, fx, fy, mat, alive, heat, stress, pres } = this;
       let nb = this.nb;
       for (let b = 0; b < nb; b++) {
         const i = ba[b], j = bb[b];
@@ -821,6 +827,8 @@
         const vn = (vx[j] - vx[i]) * nx + (vy[j] - vy[i]) * ny;
         const f = MK[m] * (len - r) + MCB[m] * vn;
         fx[i] += f * nx; fy[i] += f * ny; fx[j] -= f * nx; fy[j] -= f * ny;
+        const vb = f * len;
+        pres[i] -= vb; pres[j] -= vb;
         const s = Math.abs(tot) / MFR[m];
         if (s > stress[i]) stress[i] = s;
         if (s > stress[j]) stress[j] = s;

@@ -186,6 +186,9 @@ struct State {
     c2t: *mut f64,
     // smoothed speed of each explosive particle (shock strength that initiates detonation)
     uav: *mut f64,
+    // signed per-particle pressure (gas: EOS; solid: virial), and per-bond tension * length
+    pres: *mut f32,
+    bvir: *mut f32,
     gas: bool,
     gas_dt: f64,
 }
@@ -199,7 +202,7 @@ static mut S: State = State {
     ba: 0 as _, bb: 0 as _, brest: 0 as _, borig: 0 as _, bout: 0 as _, expl: 0 as _,
     gcnt: 0 as _, gslot: 0 as _, mt: 0 as _, events: 0 as _, v2t: 0 as _,
     scratch: 0 as _, order: 0 as _, inv: 0 as _, tmp: 0 as _, layout: 0 as _,
-    rho: 0 as _, pr: 0 as _, gx: 0 as _, gy: 0 as _, c2t: 0 as _, uav: 0 as _, gas: false, gas_dt: f64::INFINITY,
+    rho: 0 as _, pr: 0 as _, gx: 0 as _, gy: 0 as _, c2t: 0 as _, uav: 0 as _, pres: 0 as _, bvir: 0 as _, gas: false, gas_dt: f64::INFINITY,
 };
 
 static NEXT: AtomicU32 = AtomicU32::new(0);
@@ -314,6 +317,8 @@ pub unsafe extern "C" fn setup(
     s.gx = alloc(n);
     s.gy = alloc(n);
     s.c2t = alloc(MAXT);
+    s.pres = alloc(n);
+    s.bvir = alloc(nb);
     s.uav = alloc(n);
     if !s.uav.is_null() {
         core::ptr::write_bytes(s.uav as *mut u8, 0, n * core::mem::size_of::<f64>());
@@ -328,11 +333,11 @@ pub unsafe extern "C" fn setup(
         return 0;
     }
     let l = s.layout;
-    let ptrs: [usize; 19] = [
+    let ptrs: [usize; 20] = [
         s.px as usize, s.py as usize, s.vx as usize, s.vy as usize, s.invm as usize, s.dett as usize,
         s.heat as usize, s.stress as usize, s.mat as usize, s.grp as usize, s.alive as usize,
         s.ba as usize, s.bb as usize, s.brest as usize, s.borig as usize, s.expl as usize,
-        s.mt as usize, s.events as usize, s.uav as usize,
+        s.mt as usize, s.events as usize, s.uav as usize, s.pres as usize,
     ];
     for (k, p) in ptrs.iter().enumerate() {
         *l.add(k) = *p as u32;
@@ -424,6 +429,7 @@ unsafe fn reorder() {
     permute(s.grp, m);
     permute(s.alive, m);
     permute(s.uav, m);
+    permute(s.pres, m);
     s.n = m;
 
     // compact bonds
@@ -620,6 +626,7 @@ unsafe fn contacts(s: &State, lo: usize, hi: usize) {
     let gw = s.gw as isize;
     let nm = s.nm;
     for i in lo..hi {
+        *s.pres.add(i) = 0.0;
         if *s.alive.add(i) == 0 {
             continue;
         }
@@ -642,6 +649,7 @@ unsafe fn contacts(s: &State, lo: usize, hi: usize) {
         let mut fx = 0.0f64;
         let mut fy = 0.0f64;
         let mut h = 0.0f64;
+        let mut pv = 0.0f64;
         for dy in [-gw, 0, gw] {
             for dx in [-1isize, 0, 1] {
                 let cc = (g as isize + c as isize + dy + dx) as usize;
@@ -695,12 +703,14 @@ unsafe fn contacts(s: &State, lo: usize, hi: usize) {
                     }
                     fx -= f * nx - tx;
                     fy -= f * ny - ty;
+                    pv += f * d;
                 }
             }
         }
         *s.fcx.add(i) = fx;
         *s.fcy.add(i) = fy;
         *s.heat.add(i) += h as f32;
+        *s.pres.add(i) = pv as f32;
     }
 }
 
@@ -710,6 +720,7 @@ unsafe fn bonds(s: &State, lo: usize, hi: usize) {
     let min_rest = *mt.add(MT_CONST + 4);
     let break_heat = *mt.add(MT_CONST + 5) as f32;
     for b in lo..hi {
+        *s.bvir.add(b) = 0.0;
         let out = s.bout.add(b * 4);
         let o = *s.borig.add(b);
         if o < 0.0 {
@@ -774,6 +785,7 @@ unsafe fn bonds(s: &State, lo: usize, hi: usize) {
         *out.add(1) = (f * ny) as f32;
         *out.add(2) = h as f32;
         *out.add(3) = (abs(tot) / mfr) as f32;
+        *s.bvir.add(b) = (f * len) as f32;
     }
 }
 
@@ -800,6 +812,7 @@ unsafe fn integrate(s: &State, lo: usize, hi: usize) -> f64 {
         }
         let mut hb = 0.0f32;
         let mut smax = 0.0f32;
+        let mut pv = *s.pres.add(i) as f64;
         let a = s.adj.add(i * ADJ);
         for k in 0..ADJ {
             let e = *a.add(k);
@@ -811,6 +824,7 @@ unsafe fn integrate(s: &State, lo: usize, hi: usize) -> f64 {
             if w < 0.0 {
                 continue;
             }
+            pv -= *s.bvir.add((e >> 1) as usize) as f64;
             if e & 1 == 0 {
                 fx += *out as f64;
                 fy += *out.add(1) as f64;
@@ -824,6 +838,7 @@ unsafe fn integrate(s: &State, lo: usize, hi: usize) -> f64 {
             }
         }
         *s.stress.add(i) = smax;
+        *s.pres.add(i) = if *s.mt.add(MT_MGAS + *s.mat.add(i) as usize) != 0.0 { *s.pr.add(i) as f32 } else { pv as f32 };
         let h = (*s.heat.add(i) + hb) * decay;
         *s.heat.add(i) = if h > 2.0 { 2.0 } else { h };
         let im = *s.invm.add(i);

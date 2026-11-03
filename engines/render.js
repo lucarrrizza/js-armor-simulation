@@ -30,7 +30,7 @@ struct U {
   rings: array<vec4f, ${MAXRINGS}>,
 };
 struct FX { a: vec4f, b: vec4f }; // pos.xy vel.xy (units, units/us) | age, life (us), kind, size (units)
-struct Part { p: vec4f, heat: f32, stress: f32, mat: u32, alive: bool };
+struct Part { p: vec4f, heat: f32, stress: f32, mat: u32, alive: bool, pres: f32 };
 @group(0) @binding(0) var<uniform> u: U;
 
 fn toClip(w: vec2f) -> vec4f {
@@ -64,12 +64,14 @@ fn unit(s: u32) -> f32 { return f32(s & 0xffffu) / 65535.0; }
 @group(1) @binding(0) var<storage, read> pv: array<vec4f>;
 @group(1) @binding(1) var<storage, read> pa: array<vec4f>;
 @group(1) @binding(2) var<storage, read> pm: array<vec4u>;
-fn part(i: u32) -> Part { let f = pm[i].w; let a = pa[i]; return Part(pv[i], a.z, a.w, f & 255u, (f & 256u) != 0u); }
+@group(1) @binding(3) var<storage, read> pp: array<f32>;
+fn part(i: u32) -> Part { let f = pm[i].w; let a = pa[i]; return Part(pv[i], a.z, a.w, f & 255u, (f & 256u) != 0u, pp[i]); }
 `;
   const SRC_CPU = /* wgsl */`
 @group(1) @binding(0) var<storage, read> pv: array<vec4f>;
 @group(1) @binding(1) var<storage, read> pq: array<vec4f>;
-fn part(i: u32) -> Part { let q = pq[i]; return Part(pv[i], q.x, q.y, u32(q.z), q.w > 0.5); }
+@group(1) @binding(2) var<storage, read> pp: array<f32>;
+fn part(i: u32) -> Part { let q = pq[i]; return Part(pv[i], q.x, q.y, u32(q.z), q.w > 0.5, pp[i]); }
 `;
 
   // shared by the quad and splat paths: particle colour and motion-trail length (device px, 0 = none)
@@ -92,6 +94,12 @@ fn partColor(q: Part) -> vec3f {
     e = vec3f(0.0);
   } else if (mode == 2u) {
     c = turbo(length(q.p.zw) * u.look.y);
+    e = vec3f(0.0);
+  } else if (mode == 4u) {
+    // signed pressure: compression blue, tension red
+    let t = tanh(q.pres / 300.0);
+    let dark = vec3f(0.16, 0.17, 0.2);
+    c = select(mix(dark, vec3f(0.95, 0.25, 0.2), -t), mix(dark, vec3f(0.2, 0.45, 1.0), t), t >= 0.0);
     e = vec3f(0.0);
   } else {
     c = select(heatRGB(h / 2.0), vec3f(45.0, 50.0, 62.0) / 255.0, h < 0.06);
@@ -478,8 +486,8 @@ fn shoulder(x: vec3f) -> vec3f {
       const dev = this.device;
       if (sim.bufs && sim.device === dev) {
         if (this.src && this.src.sim === sim && this.src.gen === sim.gen) return this.src;
-        if (this.src && this.src.variant === 'cpu') { this.src.pvBuf.destroy(); this.src.pqBuf.destroy(); }
-        const entries = ['pv', 'pa', 'pm'].map((k, i) => ({ binding: i, resource: { buffer: sim.bufs[k] } }));
+        if (this.src && this.src.variant === 'cpu') { this.src.pvBuf.destroy(); this.src.pqBuf.destroy(); this.src.ppBuf.destroy(); }
+        const entries = ['pv', 'pa', 'pm', 'rp'].map((k, i) => ({ binding: i, resource: { buffer: sim.bufs[k] } }));
         const P = this.pipes.gpu;
         this.src = {
           sim, gen: sim.gen, variant: 'gpu', n: sim.n,
@@ -492,15 +500,16 @@ fn shoulder(x: vec3f) -> vec3f {
       const n = sim.n;
       let s = this.src;
       if (!s || s.variant !== 'cpu' || s.cap < n) {
-        if (s && s.variant === 'cpu') { s.pvBuf.destroy(); s.pqBuf.destroy(); }
+        if (s && s.variant === 'cpu') { s.pvBuf.destroy(); s.pqBuf.destroy(); s.ppBuf.destroy(); }
         const cap = Math.max(1024, Math.ceil(n * 1.25));
         const S = GPUBufferUsage;
         const pvBuf = dev.createBuffer({ size: cap * 16, usage: S.STORAGE | S.COPY_DST });
         const pqBuf = dev.createBuffer({ size: cap * 16, usage: S.STORAGE | S.COPY_DST });
-        const entries = [{ binding: 0, resource: { buffer: pvBuf } }, { binding: 1, resource: { buffer: pqBuf } }];
+        const ppBuf = dev.createBuffer({ size: cap * 4, usage: S.STORAGE | S.COPY_DST });
+        const entries = [{ binding: 0, resource: { buffer: pvBuf } }, { binding: 1, resource: { buffer: pqBuf } }, { binding: 2, resource: { buffer: ppBuf } }];
         const P = this.pipes.cpu;
         s = this.src = {
-          variant: 'cpu', cap, pvBuf, pqBuf, pv: new Float32Array(cap * 4), pq: new Float32Array(cap * 4),
+          variant: 'cpu', cap, pvBuf, pqBuf, ppBuf, pv: new Float32Array(cap * 4), pq: new Float32Array(cap * 4),
           drawG: dev.createBindGroup({ layout: P.draw.getBindGroupLayout(1), entries }),
           emitG: dev.createBindGroup({ layout: P.emit.getBindGroupLayout(1), entries }),
           splatG: dev.createBindGroup({ layout: P.splat.getBindGroupLayout(1), entries }),
@@ -509,7 +518,7 @@ fn shoulder(x: vec3f) -> vec3f {
       // CPU engines: re-upload only when the simulation moved on (nothing to do while paused)
       if (s.sim === sim && s.n === n && s.time === sim.time && !this.dirty) return s;
       s.sim = sim; s.n = n; s.time = sim.time; this.dirty = false;
-      const { px, py, vx, vy, heat, stress, mat, alive } = sim;
+      const { px, py, vx, vy, heat, stress, mat, alive, pres } = sim;
       const pv = s.pv, pq = s.pq;
       for (let i = 0, k = 0; i < n; i++, k += 4) {
         pv[k] = px[i]; pv[k + 1] = py[i]; pv[k + 2] = vx[i]; pv[k + 3] = vy[i];
@@ -518,6 +527,7 @@ fn shoulder(x: vec3f) -> vec3f {
       if (n) {
         dev.queue.writeBuffer(s.pvBuf, 0, pv, 0, n * 4);
         dev.queue.writeBuffer(s.pqBuf, 0, pq, 0, n * 4);
+        dev.queue.writeBuffer(s.ppBuf, 0, pres, 0, n);
       }
       return s;
     }

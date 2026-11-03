@@ -248,21 +248,22 @@
   });
 
   // ---------- record & replay ----------
-  // "Run to tf" simulates up to tf and keeps evenly spaced snapshots. Snapshots are quantised to
-  // ~11 bytes per particle (positions to 1/65535 of the box, velocities to 1/32767 of the frame's
-  // fastest particle), so replays are engine independent and scrubbing is instant.
-  const REC_BYTES = 8e8;
+  // Snapshots are quantised to ~12 bytes per particle (positions to 1/65535 of the box, velocities to
+  // 1/32767 of the frame's fastest particle, pressure to PRES_STEP units), so replays are engine
+  // independent and scrubbing is instant.
+  const REC_BYTES = 8e8, PRES_STEP = 8;
   let buildGen = 0, recStarting = false, keepReplay = false;
   let rec = null;      // recording in progress
   let replay = null;   // finished recording: { key, frames, idx, view }
   let replayMode = false, replayPlaying = false, replayUs = 0;
 
   function encodeFrame(s, evs) {
-    const n = s.n, buf = new ArrayBuffer(n * 11);
+    const n = s.n, buf = new ArrayBuffer(n * 12);
     const X = new Uint16Array(buf, 0, n), Y = new Uint16Array(buf, 2 * n, n);
     const VX = new Int16Array(buf, 4 * n, n), VY = new Int16Array(buf, 6 * n, n);
     const H = new Uint8Array(buf, 8 * n, n), S = new Uint8Array(buf, 9 * n, n), M = new Uint8Array(buf, 10 * n, n);
-    const { px, py, vx, vy, heat, stress, mat, alive } = s;
+    const P = new Int8Array(buf, 11 * n, n);
+    const { px, py, vx, vy, heat, stress, mat, alive, pres } = s;
     const x0 = s.bx0 - 1, y0 = s.by0 - 1, sx = 65535 / (s.bx1 - s.bx0 + 2), sy = 65535 / (s.by1 - s.by0 + 2);
     let vm = 1e-6;
     for (let i = 0; i < n; i++) if (alive[i]) vm = Math.max(vm, Math.abs(vx[i]), Math.abs(vy[i]));
@@ -275,6 +276,7 @@
       VX[i] = Math.round(vx[i] * vs) || 0; VY[i] = Math.round(vy[i] * vs) || 0;
       H[i] = Math.min(255, Math.max(0, Math.round(heat[i] * 100)));
       S[i] = Math.min(254, Math.max(0, Math.round(stress[i] * 254)));
+      P[i] = Math.max(-127, Math.min(127, Math.round(pres[i] / PRES_STEP)));
     }
     return { t: s.time, n, buf, vm, stats: s.stats(), events: evs };
   }
@@ -284,6 +286,7 @@
     const X = new Uint16Array(buf, 0, n), Y = new Uint16Array(buf, 2 * n, n);
     const VX = new Int16Array(buf, 4 * n, n), VY = new Int16Array(buf, 6 * n, n);
     const H = new Uint8Array(buf, 8 * n, n), S = new Uint8Array(buf, 9 * n, n), M = new Uint8Array(buf, 10 * n, n);
+    const P = new Int8Array(buf, 11 * n, n);
     const x0 = v.bx0 - 1, y0 = v.by0 - 1, sx = (v.bx1 - v.bx0 + 2) / 65535, sy = (v.by1 - v.by0 + 2) / 65535, vs = f.vm / 32767;
     for (let i = 0; i < n; i++) {
       v.mat[i] = M[i];
@@ -292,6 +295,7 @@
       v.px[i] = x0 + X[i] * sx; v.py[i] = y0 + Y[i] * sy;
       v.vx[i] = VX[i] * vs; v.vy[i] = VY[i] * vs;
       v.heat[i] = H[i] / 100; v.stress[i] = st === 255 ? 0 : st / 254;
+      v.pres[i] = P[i] * PRES_STEP;
     }
     v.n = n; v.time = f.t;
   }
@@ -301,7 +305,7 @@
     const v = { n: 0, time: 0, events: [], replay: true };
     for (const k of ['res', 'usPerT', 'bx0', 'bx1', 'by0', 'by1', 'losThickness', 'stackLos']) v[k] = s[k];
     v.fit = Object.assign({}, s.fit);
-    for (const k of ['px', 'py', 'vx', 'vy', 'heat', 'stress']) v[k] = new Float32Array(nMax);
+    for (const k of ['px', 'py', 'vx', 'vy', 'heat', 'stress', 'pres']) v[k] = new Float32Array(nMax);
     v.mat = new Uint8Array(nMax); v.alive = new Uint8Array(nMax);
     return v;
   }
@@ -323,7 +327,7 @@
     if (!sim) return;
     const tf = Math.max(1, +$('recTf').value || 300);
     let frames = Math.max(2, Math.min(5000, Math.round(+$('recFrames').value || 300)));
-    const perFrame = sim.n * 11 + 256;
+    const perFrame = sim.n * 12 + 256;
     const maxFrames = Math.floor(REC_BYTES / perFrame);
     let note = '';
     if (maxFrames < 2) { $('recInfo').textContent = 'Too many particles to record; try a coarser resolution.'; return; }
@@ -552,6 +556,12 @@
     const s = t < 0.02 ? [70, 80, 95] : turbo(0.15 + 0.85 * t);
     stressLUT[i] = rgba(...s.map(Math.round));
   }
+  // signed pressure: x = tanh(p / 300) in [-1, 1]; compression blue, tension red (as in render.js)
+  const presLUT = new Uint32Array(HL);
+  for (let i = 0; i < HL; i++) {
+    const x = 2 * i / (HL - 1) - 1, dark = [41, 43, 51], c = x >= 0 ? [51, 115, 255] : [242, 64, 51], a = Math.abs(x);
+    presLUT[i] = rgba(...dark.map((d, k) => Math.round(d + (c[k] - d) * a)));
+  }
 
   function buildLegend() {
     const used = new Set();
@@ -568,6 +578,7 @@
         stress: [stressLUT, 'intact', 'about to break'],
         vel: [turboLUT, '0', refV().toFixed(0) + ' m/s'],
         heat: [heatLUT, 'cold', 'white hot'],
+        press: [presLUT, 'tension', 'compression'],
       }[mode];
       html = `<div style="flex-direction:column;align-items:stretch"><i style="width:160px;height:10px;background:${grad(info[0])}"></i>` +
         `<div style="justify-content:space-between"><span>${info[1]}</span><span>${info[2]}</span></div></div>`;
@@ -584,7 +595,7 @@
   }
 
   function drawParticles() {
-    const { n, px, py, alive, mat, heat, stress, vx, vy } = sim;
+    const { n, px, py, alive, mat, heat, stress, vx, vy, pres } = sim;
     const ow = off.width, oh = off.height, gw = glowC.width, gh = glowC.height;
     const bx0 = sim.bx0, by0 = sim.by0;
     const mode = $('viewMode').value;
@@ -601,13 +612,14 @@
       if (mode === 'mat') col = matLUT[mat[i]][hi];
       else if (mode === 'heat') col = heatLUT[hi];
       else if (mode === 'stress') col = stressLUT[Math.min(HL - 1, (stress[i] * (HL - 1)) | 0)];
+      else if (mode === 'press') col = presLUT[Math.round((Math.tanh(pres[i] / 300) + 1) * 0.5 * (HL - 1))];
       else col = turboLUT[Math.min(HL - 1, (Math.sqrt(vx[i] * vx[i] + vy[i] * vy[i]) * vScale) | 0)];
       const X = ((px[i] - bx0) * SS - 1) | 0, Y = ((py[i] - by0) * SS - 1) | 0;
       if (X >= 0 && Y >= 0 && X < ow - 1 && Y < oh - 1) {
         const k = Y * ow + X;
         buf32[k] = col; buf32[k + 1] = col; buf32[k + ow] = col; buf32[k + ow + 1] = col;
       }
-      if (glow && h > 0.3 && mode !== 'stress' && mode !== 'vel') {
+      if (glow && h > 0.3 && mode !== 'stress' && mode !== 'vel' && mode !== 'press') {
         const gx = ((px[i] - bx0) * GS) | 0, gy = ((py[i] - by0) * GS) | 0;
         if (gx >= 0 && gy >= 0 && gx < gw && gy < gh) {
           const c = heatRGB(Math.min(1, h / 1.8));
@@ -727,7 +739,7 @@
     drawScaleBar();
   }
 
-  const VIEW_MODES = { mat: 0, stress: 1, vel: 2, heat: 3 };
+  const VIEW_MODES = { mat: 0, stress: 1, vel: 2, heat: 3, press: 4 };
   let lastFxUs = 0;
   function renderGpu() {
     const cine = rendererKind === 'cinematic';

@@ -73,6 +73,9 @@ fn gpress(rho: f32, rhoc: f32, rho0: f32, p0: f32, pc: f32, ghi: f32, glo: f32) 
     rb: ['storage', 'var<storage, read_write> rb: array<vec4<u32>>;'],
     pg: ['storage', 'var<storage, read_write> pg: array<vec2<f32>>;'], // gas: (SPH density, pressure)
     uav: ['storage', 'var<storage, read_write> uav: array<f32>;'], // smoothed speed of each explosive, the shock driver
+    prs: ['storage', 'var<storage, read_write> prs: array<f32>;'], // solid pressure: signed virial sum per particle
+    bv: ['storage', 'var<storage, read_write> bv: array<f32>;'], // per-bond virial f*len, subtracted from both ends
+    rp: ['storage', 'var<storage, read_write> rp: array<f32>;'], // per-particle pressure, for readback and the renderer
   };
 
   const KERNELS = {
@@ -115,12 +118,14 @@ fn gpress(rho: f32, rhoc: f32, rho0: f32, p0: f32, pc: f32, ghi: f32, glo: f32) 
   pm[i].w = select(pm[i].w & ~INGRID, pm[i].w | INGRID, slot < K);
 }`],
 
-    contacts: [['P', 'st', 'pv', 'pa', 'pm', 'gcnt', 'gslot', 'mt'], /* wgsl */`
+    contacts: [['P', 'st', 'pv', 'pa', 'pm', 'gcnt', 'gslot', 'mt', 'prs'], /* wgsl */`
 @compute @workgroup_size(${WG}) fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let i = gid.x;
   if (i >= P.n) { return; }
   let dt = st.dt;
   if (dt == 0.0) { return; }
+  prs[i] = 0.0;
+  var pvir = 0.0;
   let m = pm[i];
   if ((m.w & ALIVE) == 0u) { return; }
   // detonation products take no contact forces (gas model)
@@ -167,18 +172,21 @@ fn gpress(rho: f32, rhoc: f32, rho0: f32, p0: f32, pc: f32, ghi: f32, glo: f32) 
         var t = vec2<f32>(0.0, 0.0);
         if (tv > 1e-6) { t = min(cdamp * tv, fric * abs(fn_)) * tvv / tv; }
         f -= fn_ * nrm - t;
+        pvir += fn_ * d;
       }
     }
   }
+  prs[i] = pvir;
   let a = pa[i];
   pa[i] = vec4<f32>(f, a.z + h, a.w);
 }`],
 
-    bonds: [['P', 'st', 'pv', 'pa', 'pm', 'bonds', 'bout', 'mt'], /* wgsl */`
+    bonds: [['P', 'st', 'pv', 'pa', 'pm', 'bonds', 'bout', 'mt', 'bv'], /* wgsl */`
 @compute @workgroup_size(${WG}) fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let b = gid.x;
   if (b >= P.nb) { return; }
   if (st.dt == 0.0) { return; }
+  bv[b] = 0.0;
   let bd = bonds[b];
   let o = bitcast<f32>(bd.w);
   if (o < 0.0) {
@@ -221,9 +229,10 @@ fn gpress(rho: f32, rhoc: f32, rho0: f32, p0: f32, pc: f32, ghi: f32, glo: f32) 
   let vn = dot(q.zw - p.zw, nrm);
   let f = mt[MK + m] * (len - r) + mt[MCB + m] * vn;
   bout[b] = vec4<f32>(f * nrm, h, abs(tot) / mfr);
+  bv[b] = f * len;
 }`],
 
-    integrate: [['P', 'st', 'pv', 'pa', 'pm', 'adj', 'bout'], /* wgsl */`
+    integrate: [['P', 'st', 'pv', 'pa', 'pm', 'adj', 'bout', 'bv', 'prs'], /* wgsl */`
 var<workgroup> wmax: atomic<u32>;
 fn one(i: u32, dt: f32) -> f32 {
   let m = pm[i];
@@ -232,6 +241,7 @@ fn one(i: u32, dt: f32) -> f32 {
   var f = a.xy;
   var hb = 0.0;
   var smax = 0.0;
+  var pvir = prs[i];
   for (var k = 0u; k < ADJ; k++) {
     let e = adj[i * ADJ + k];
     if (e == NONE) { break; }
@@ -240,7 +250,9 @@ fn one(i: u32, dt: f32) -> f32 {
     if ((e & 1u) == 0u) { f += o.xy; } else { f -= o.xy; }
     hb += o.z;
     smax = max(smax, o.w);
+    pvir -= bv[e >> 1u];
   }
+  prs[i] = pvir;
   pa[i] = vec4<f32>(0.0, 0.0, min(2.0, (a.z + hb) * exp(-dt / 20.0)), smax);
   let im = bitcast<f32>(m.x);
   var p = pv[i];
@@ -497,7 +509,7 @@ var<workgroup> wc2: atomic<u32>;
   }
 }`],
 
-    pack: [['P', 'pv', 'pa', 'pm', 'rb'], /* wgsl */`
+    pack: [['P', 'pv', 'pa', 'pm', 'rb', 'mt', 'prs', 'pg', 'rp'], /* wgsl */`
 @compute @workgroup_size(${WG}) fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let i = gid.x + P.lo;
   if (i >= P.n) { return; }
@@ -506,6 +518,8 @@ var<workgroup> wc2: atomic<u32>;
   var h = a.z;
   if ((pm[i].w & ALIVE) == 0u) { h = -1.0; }
   rb[i - P.lo] = vec4<u32>(bitcast<u32>(p.x), bitcast<u32>(p.y), pack2x16float(p.zw), pack2x16float(vec2<f32>(h, a.w)));
+  // gas: EOS pressure from gasPressure; solids: virial sum
+  rp[i] = select(prs[i], pg[i].y, mt[MGAS + (pm[i].w & 255u)] != 0.0);
 }`],
   };
 
@@ -646,12 +660,16 @@ var<workgroup> wc2: atomic<u32>;
         expl: mk(nexpl ? explP : null, ST, nexpl * 4),
         pg: mk(null, ST, n * 8),
         uav: mk(null, ST, n * 4),
+        prs: mk(null, ST, n * 4),
+        bv: mk(null, ST, nb * 4),
         ev: mk(null, ST | S.COPY_SRC, EVCAP * 16),
         rb: mk(null, ST | S.COPY_SRC, (n - this.lo) * 16),
+        rp: mk(null, ST | S.COPY_SRC, n * 4),
       };
       this.evOff = STATE_SIZE;
       this.rbOff = STATE_SIZE + EVCAP * 16;
-      this.bufs.staging = dev.createBuffer({ size: this.rbOff + (n - this.lo) * 16, usage: S.MAP_READ | S.COPY_DST });
+      this.rpOff = this.rbOff + (n - this.lo) * 16;
+      this.bufs.staging = dev.createBuffer({ size: this.rpOff + (n - this.lo) * 4, usage: S.MAP_READ | S.COPY_DST });
       this.groups = {};
       for (const [name, p] of Object.entries(this.pipes)) {
         this.groups[name] = dev.createBindGroup({
@@ -669,7 +687,7 @@ var<workgroup> wc2: atomic<u32>;
       this.mat = mat; this.grp = grp;
       const pick = (src) => { const a = new Float32Array(n); for (let o = 0; o < n; o++) a[perm[o]] = src[o]; return a; };
       this.px = pick(b.px); this.py = pick(b.py); this.vx = pick(b.vx); this.vy = pick(b.vy);
-      this.heat = pick(b.heat); this.stress = new Float32Array(n);
+      this.heat = pick(b.heat); this.stress = new Float32Array(n); this.pres = new Float32Array(n);
       this.alive = new Uint8Array(n).fill(1);
       this.time = 0; this.steps = 0; this.events = [];
       this.msPerStep = Math.max(0.05, n * 2e-5); // rough first guess; refined from measurements
@@ -728,7 +746,10 @@ var<workgroup> wc2: atomic<u32>;
       const stg = bufs.staging;
       enc.copyBufferToBuffer(bufs.st, 0, stg, 0, STATE_SIZE);
       enc.copyBufferToBuffer(bufs.ev, 0, stg, this.evOff, EVCAP * 16);
-      if (n > lo) enc.copyBufferToBuffer(bufs.rb, 0, stg, this.rbOff, (n - lo) * 16);
+      if (n > lo) {
+        enc.copyBufferToBuffer(bufs.rb, 0, stg, this.rbOff, (n - lo) * 16);
+        enc.copyBufferToBuffer(bufs.rp, lo * 4, stg, this.rpOff, (n - lo) * 4);
+      }
       dev.queue.submit([enc.finish()]);
       try {
         await stg.mapAsync(GPUMapMode.READ);
@@ -747,8 +768,9 @@ var<workgroup> wc2: atomic<u32>;
       const ev = new Float32Array(data, this.evOff, nev * 4);
       for (let k = 0; k < nev; k++) this.events.push({ x: ev[k * 4], y: ev[k * 4 + 1], t: ev[k * 4 + 2] });
       const rbF = new Float32Array(data, this.rbOff, (n - lo) * 4), rbU = new Uint32Array(data, this.rbOff, (n - lo) * 4);
+      const rpF = new Float32Array(data, this.rpOff, n - lo);
       const T = f16Table();
-      const { px, py, vx, vy, heat, stress, alive } = this;
+      const { px, py, vx, vy, heat, stress, alive, pres } = this;
       for (let i = lo, k = 0; i < n; i++, k += 4) {
         px[i] = rbF[k]; py[i] = rbF[k + 1];
         const v = rbU[k + 2], hs = rbU[k + 3];
@@ -756,6 +778,7 @@ var<workgroup> wc2: atomic<u32>;
         const h = T[hs & 0xffff];
         alive[i] = h >= 0 ? 1 : 0;
         heat[i] = h; stress[i] = T[hs >>> 16];
+        pres[i] = rpF[i - lo];
       }
       stg.unmap();
       if (steps > 0) this.msPerStep = Math.max(0.01, this.msPerStep * 0.5 + (performance.now() - t0) / steps * 0.5);
