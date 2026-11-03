@@ -7,6 +7,7 @@
   const { MATS } = G.ImpactSim;
   const NA = 16384, NB = 32768, NFX = NA + NB, EMIT_N = 8192, MAXRINGS = 16, MIPS = 6, WG = 128;
   const FIRE = 1, SMOKE = 2, SPARK = 3, RING = 4;
+  const FX_DRAG = { [FIRE]: 0.05, [SMOKE]: 0.025, [SPARK]: 0.008 }; // per µs, must match FX_UPDATE
   const HDR = 'rgba16float';
   const RING_SPEED = 3.0, RING_LIFE = 70; // mm/µs, µs
   const U_HEAD = 7; // vec4s in U before mats
@@ -477,6 +478,7 @@ fn shoulder(x: vec3f) -> vec3f {
       const dev = this.device;
       if (sim.bufs && sim.device === dev) {
         if (this.src && this.src.sim === sim && this.src.gen === sim.gen) return this.src;
+        if (this.src && this.src.variant === 'cpu') { this.src.pvBuf.destroy(); this.src.pqBuf.destroy(); }
         const entries = ['pv', 'pa', 'pm'].map((k, i) => ({ binding: i, resource: { buffer: sim.bufs[k] } }));
         const P = this.pipes.gpu;
         this.src = {
@@ -533,7 +535,12 @@ fn shoulder(x: vec3f) -> vec3f {
       }
       const out = [];
       const rnd = Math.random;
-      const push = (x, y, vx, vy, age, life, kind, size) => out.push(x, y, vx, vy, age, life, kind, size);
+      // effects that start already aged (late readbacks, replay seeks) are moved to where FX_UPDATE would have put them
+      const push = (x, y, vx, vy, age, life, kind, size) => {
+        const d = FX_DRAG[kind];
+        if (age > 0 && d) { const e = Math.exp(-d * age), f = (1 - e) / d; x += vx * f; y += vy * f; vx *= e; vy *= e; }
+        out.push(x, y, vx, vy, age, life, kind, size);
+      };
       // emission scales with detonated area (mm²), so it doesn't depend on resolution or frame rate
       const count = (perMm2, A) => { const x = perMm2 * A; return Math.floor(x) + (rnd() < x % 1 ? 1 : 0); };
       for (const [key, e] of this.cellA) if (nowUs - e.t > 40) this.cellA.delete(key);

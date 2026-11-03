@@ -419,7 +419,7 @@ fn one(i: u32, dt: f32) -> f32 {
       const b = new Sim();
       b.build(scn);
       for (const k of ['res', 'usPerT', 'cos', 'sin', 'layers', 'armorDepth', 'armorFront', 'stackLos', 'losThickness',
-        'entryX', 'fit', 'bx0', 'bx1', 'by0', 'by1', 'gw', 'gh', 'projMass0', 'dtStab', 'vmax']) this[k] = b[k];
+        'entryX', 'fit', 'bx0', 'bx1', 'by0', 'by1', 'gw', 'gh', 'projMass0', 'dtStab', 'vmax', 'fillFailed']) this[k] = b[k];
       const n = b.n, nb = b.nb, nexpl = b.expl.length;
       const cells = b.gw * b.gh;
       const dev = this.device;
