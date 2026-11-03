@@ -131,7 +131,7 @@
       $('count').textContent = `Could not build this scene: ${e.message}. Try a coarser resolution.`;
       return;
     }
-    const heavy = (engineKind === 'js' && sim.n > 60000) || (engineKind === 'wasm' && sim.n > 500000);
+    const heavy = engineKind === 'js' && sim.n > 60000;
     $('count').textContent = `${sim.n.toLocaleString()} particles · ${sim.nb.toLocaleString()} bonds` +
       (heavy ? ' — heavy! try the GPU engine or a coarser resolution' : '');
     if (renderer) renderer.reset();
@@ -144,12 +144,9 @@
   }
 
   // ---------- engines ----------
-  const engineSel = $('engine'), threadsSel = $('threads');
-  const hwThreads = navigator.hardwareConcurrency || 4;
-  for (let t = 1; t <= Math.min(64, hwThreads); t++) threadsSel.add(new Option(String(t), String(t)));
-  threadsSel.value = String(Math.max(1, Math.min(hwThreads - 1, Math.round(hwThreads * 0.5))));
-  const engineAvail = { gpu: GpuSim.available(), wasm: WasmSim.available(), js: true };
-  const engineWhy = { gpu: 'no WebGPU in this browser', wasm: 'start with: python3 serve.py' };
+  const engineSel = $('engine');
+  const engineAvail = { gpu: GpuSim.available(), js: true };
+  const engineWhy = { gpu: 'no WebGPU in this browser' };
   for (const o of engineSel.options) {
     if (!engineAvail[o.value]) { o.disabled = true; o.textContent += ` — ${engineWhy[o.value]}`; }
   }
@@ -158,11 +155,6 @@
 
   async function createEngine(kind) {
     if (kind === 'gpu') return engineCache.gpu || (engineCache.gpu = await GpuSim.create());
-    if (kind === 'wasm') {
-      const t = +threadsSel.value;
-      if (engineCache.wasm && engineCache.wasm.threads !== t) { engineCache.wasm.dispose(); engineCache.wasm = null; }
-      return engineCache.wasm || (engineCache.wasm = await WasmSim.create(t));
-    }
     return null;
   }
 
@@ -177,24 +169,22 @@
       engineKind = kind;
     } catch (e) {
       console.error(e);
-      msg = `${kind === 'gpu' ? 'GPU' : 'multi-core'} engine unavailable (${e.message}); using single-core JS. `;
+      msg = `GPU engine unavailable (${e.message}); using single-core JS. `;
       engineObj = null; engineKind = 'js';
     }
     engineSel.value = engineKind;
-    $('threadsRow').style.display = engineKind === 'wasm' ? '' : 'none';
     $('engineInfo').textContent = msg + 'Running on ' + (engineObj ? engineObj.engineName : 'single-core CPU (JS)');
     try { localStorage.setItem('impactEngine', engineKind); } catch (e) { /* storage disabled */ }
     engineReady = true;
     rebuild(!!sim);
   }
   engineSel.addEventListener('change', () => selectEngine(engineSel.value));
-  threadsSel.addEventListener('change', () => selectEngine('wasm'));
 
   function initialEngine() {
     let want = new URLSearchParams(location.search).get('engine');
     if (!want) try { want = localStorage.getItem('impactEngine'); } catch (e) { /* storage disabled */ }
     if (want && engineAvail[want]) return want;
-    return engineAvail.gpu ? 'gpu' : engineAvail.wasm ? 'wasm' : 'js';
+    return engineAvail.gpu ? 'gpu' : 'js';
   }
 
   // Reset rebuilds the scene at t = 0 and stays paused (and leaves the replay, which is kept)

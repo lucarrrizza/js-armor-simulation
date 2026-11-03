@@ -1043,7 +1043,7 @@
   }
 
 
-  // Packed parameter table shared with rust/src/lib.rs (MT_*), engines/wasm.js and engines/gpu.js.
+  // Packed parameter table read by the GPU kernels (layout defined in sim.js).
   // Per-material tables have MAXM slots each. Pair tables are indexed a*NM+b. Scalars sit at MTL.CONST.
   const MAXM = 32;
   const MTL = {

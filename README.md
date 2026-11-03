@@ -15,20 +15,18 @@ python3 serve.py --open   # also opens the browser
 Use `localhost`, not the `[::]` / `0.0.0.0` address some servers print. Keep the terminal open while
 you use the page.
 
-You can also just open `index.html` in Chrome/Edge, but then the multi-core engine is unavailable
-(it needs the cross-origin isolation headers `serve.py` sends; a plain `python -m http.server` won't do).
+You can also open `index.html` directly in Chrome/Edge, but `serve.py` is the recommended way to run it.
 
 ## Engines
 
-Pick one under **Simulation → Engine** (or add `?engine=gpu|wasm|js` to the URL):
+Pick one under **Simulation → Engine** (or add `?engine=gpu|js` to the URL):
 
 | Engine | Needs | Notes |
 |---|---|---|
 | GPU (WebGPU) | Chrome/Edge 113+ | Fastest, especially at fine resolution. Uses 32-bit floats. |
-| Multi-core CPU (Rust) | `serve.py` | Rust compiled to multi-threaded WebAssembly; set the thread count in the UI. |
 | Single-core CPU (JS) | nothing | The reference implementation and fallback. |
 
-All engines share the same physics, so results agree to within a few percent.
+Both engines share the same physics, so results agree to within a few percent.
 
 **Resolution** (Simulation → Resolution) goes down to 0.5 mm, which is about 1 million particles for a
 500 mm block. Use the GPU engine for anything finer than about 2 mm. When a frame can't keep up, the
@@ -94,11 +92,4 @@ Use the **Draw** section to add your own armor and projectiles:
 - Set **Projectile → Type** to **None** to use only your drawn ones.
 - Drawings are saved in the browser (localStorage) and rebuilt at the current resolution.
 
-## Rebuilding the Rust engine
 
-The compiled `wasm/armor_sim.wasm` is checked in, so this is only needed after editing `rust/src/lib.rs`:
-
-```sh
-rustup target add wasm32-wasip1-threads
-./build-wasm.sh
-```

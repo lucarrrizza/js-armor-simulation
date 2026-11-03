@@ -12,7 +12,7 @@
   const ALIVE = 256, FIRE = 512, INGRID = 1024;
   // impact fuze mode in pm.w bits 11-12 (1 waiting to arm, 3 armed); thresholds must match sim.js
   const FZ_SH = 11, FZ_MASK = 3 << FZ_SH, ARM_SPEED = 2, IMPACT_DROP = 0.5;
-  // packed parameter table, same layout as rust/src/lib.rs (MT_*) and engines/wasm.js; see PHYS.packMT in sim.js
+  // packed parameter table, layout defined in PHYS.MTL (sim.js); see PHYS.packMT
   const MT = PHYS.MTL;
   const STATE_SIZE = 48;
 
@@ -291,7 +291,7 @@ fn one(i: u32, dt: f32) -> f32 {
   if (li == 0u) { atomicMax(&st.vacc, atomicLoad(&wmax)); }
 }`],
 
-    // gas model, same maths as gas_density()/gas_force() in rust/src/lib.rs. Each pass only writes its
+    // gas model, same maths as the JS reference (Sim in sim.js). Each pass only writes its
     // own particle, so the three passes are separate dispatches: density, then pressure (which also
     // removes smoke), then the pair forces in gather form.
     gasDensity: [['P', 'st', 'pv', 'pm', 'gcnt', 'gslot', 'mt', 'pg'], /* wgsl */`

@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 """Local server for Impact Sandbox.
 
-The multi-core (Rust/WASM) engine needs SharedArrayBuffer, which browsers only
-enable on cross-origin-isolated pages, so this adds the COOP/COEP headers.
-
-    python3 serve.py [port] [--engine gpu|wasm|js] [--open]
+    python3 serve.py [port] [--engine gpu|js] [--open]
 """
 import argparse
 import http.server
@@ -13,12 +10,7 @@ import webbrowser
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
-    extensions_map = {**http.server.SimpleHTTPRequestHandler.extensions_map,
-                      '.wasm': 'application/wasm', '.js': 'text/javascript'}
-
     def end_headers(self):
-        self.send_header('Cross-Origin-Opener-Policy', 'same-origin')
-        self.send_header('Cross-Origin-Embedder-Policy', 'require-corp')
         self.send_header('Cache-Control', 'no-store')
         super().end_headers()
 
@@ -29,7 +21,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('port', nargs='?', type=int, default=8000)
-    ap.add_argument('--engine', choices=['gpu', 'wasm', 'js'])
+    ap.add_argument('--engine', choices=['gpu', 'js'])
     ap.add_argument('--open', action='store_true', help='open in the default browser')
     args = ap.parse_args()
 
