@@ -10,6 +10,8 @@
   const K = 6, ADJ = 8, NONE = 0xffffffff, EVCAP = 2048;
   const BATCH_MS = 40;
   const ALIVE = 256, FIRE = 512, INGRID = 1024;
+  // impact fuze mode in pm.w bits 11-12 (1 waiting to arm, 3 armed); thresholds must match sim.js
+  const FZ_SH = 11, FZ_MASK = 3 << FZ_SH, ARM_SPEED = 2, IMPACT_DROP = 0.5;
   // packed parameter table, same layout as rust/src/lib.rs (MT_*) and engines/wasm.js; see PHYS.packMT in sim.js
   const MT = PHYS.MTL;
   const STATE_SIZE = 48;
@@ -21,6 +23,10 @@ const NONE: u32 = 0xffffffffu;
 const ALIVE: u32 = ${ALIVE}u;
 const FIRE: u32 = ${FIRE}u;
 const INGRID: u32 = ${INGRID}u;
+const FZ_SH: u32 = ${FZ_SH}u;
+const FZ_MASK: u32 = ${FZ_MASK}u;
+const ARM_SPEED: f32 = ${ARM_SPEED}.0;
+const IMPACT_DROP: f32 = ${IMPACT_DROP};
 const EVCAP: u32 = ${EVCAP}u;
 const MK: u32 = ${MT.MK}u; const MY: u32 = ${MT.MY}u; const MFR: u32 = ${MT.MFR}u; const MCR: u32 = ${MT.MCR}u;
 const MMELT: u32 = ${MT.MMELT}u; const MCB: u32 = ${MT.MCB}u; const MEXP: u32 = ${MT.MEXP}u;
@@ -76,6 +82,7 @@ fn gpress(rho: f32, rhoc: f32, rho0: f32, p0: f32, pc: f32, ghi: f32, glo: f32) 
     prs: ['storage', 'var<storage, read_write> prs: array<f32>;'], // solid pressure: signed virial sum per particle
     bv: ['storage', 'var<storage, read_write> bv: array<f32>;'], // per-bond virial f*len, subtracted from both ends
     rp: ['storage', 'var<storage, read_write> rp: array<f32>;'], // per-particle pressure, for readback and the renderer
+    fz: ['read-only-storage', 'var<storage, read> fz: array<f32>;'], // impact fuze delay per explosive (time units)
   };
 
   const KERNELS = {
@@ -413,7 +420,7 @@ var<workgroup> wc2: atomic<u32>;
   pm[i].w = select(m.w & ~INGRID, m.w | INGRID, slot < K);
 }`],
 
-    det1: [['P', 'st', 'pv', 'pa', 'pm', 'expl', 'mt', 'uav'], /* wgsl */`
+    det1: [['P', 'st', 'pv', 'pa', 'pm', 'expl', 'mt', 'uav', 'fz'], /* wgsl */`
 @compute @workgroup_size(${WG}) fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let k = gid.x;
   if (k >= P.nexpl || st.dt == 0.0) { return; }
@@ -425,15 +432,26 @@ var<workgroup> wc2: atomic<u32>;
   if (mt[MEXP + t] == 0.0) { return; }
   let now = st.time;
   var dett = bitcast<f32>(m.y);
+  var w = m.w;
   if (P.gas != 0u) {
     // gas model: the shock strength is the smoothed speed of the explosive, see detonationsGas in sim.js
+    let sp = length(pv[i].zw);
     let a = min(1.0, st.dt / mt[CN + 18u]);
-    uav[i] = uav[i] + (length(pv[i].zw) - uav[i]) * a;
-    if (dett > now && (uav[i] > mt[MUCRIT + t] || pa[i].z > mt[CN + 17u])) { dett = now; pm[i].y = bitcast<u32>(dett); }
+    let u = uav[i] + (sp - uav[i]) * a;
+    uav[i] = u;
+    // impact fuze: arms once moving fast, then fires when the speed drops sharply (target impact)
+    if (((w >> FZ_SH) & 3u) == 1u && u > ARM_SPEED) { w = (w & ~FZ_MASK) | (3u << FZ_SH); }
+    if (((w >> FZ_SH) & 3u) == 3u && sp < IMPACT_DROP * u) {
+      dett = min(dett, now + fz[i]);
+      w = w & ~FZ_MASK;
+      pm[i].y = bitcast<u32>(dett);
+    }
+    if (dett > now && (u > mt[MUCRIT + t] || pa[i].z > mt[CN + 17u])) { dett = now; pm[i].y = bitcast<u32>(dett); }
   } else if (pa[i].z > mt[CN + 7u] && dett > now) {
     dett = now; pm[i].y = bitcast<u32>(dett);
   }
-  if (dett <= now) { pm[i].w = m.w | FIRE; atomicAdd(&st.fire, 1u); }
+  if (dett <= now) { w = w | FIRE; atomicAdd(&st.fire, 1u); }
+  pm[i].w = w;
 }`],
 
     det2: [['P', 'st', 'pv', 'pa', 'pm', 'gcnt', 'gslot', 'mt'], /* wgsl */`
@@ -609,7 +627,7 @@ var<workgroup> wc2: atomic<u32>;
       this.lo = this.readAll ? 0 : lo;
       const pv = new Float32Array(n * 4), pa = new Float32Array(n * 4);
       const pmU = new Uint32Array(n * 4), pmF = new Float32Array(pmU.buffer);
-      const mat = new Uint8Array(n), grp = new Uint8Array(n);
+      const mat = new Uint8Array(n), grp = new Uint8Array(n), fzF = new Float32Array(n);
       for (let o = 0; o < n; o++) {
         const i = perm[o];
         pv[i * 4] = b.px[o]; pv[i * 4 + 1] = b.py[o]; pv[i * 4 + 2] = b.vx[o]; pv[i * 4 + 3] = b.vy[o];
@@ -617,7 +635,8 @@ var<workgroup> wc2: atomic<u32>;
         pmF[i * 4] = b.invm[o];
         pmF[i * 4 + 1] = b.detT[o] === Infinity ? 1e30 : b.detT[o];
         pmU[i * 4 + 2] = NONE;
-        pmU[i * 4 + 3] = b.mat[o] | (b.alive[o] ? ALIVE : 0);
+        pmU[i * 4 + 3] = b.mat[o] | (b.alive[o] ? ALIVE : 0) | ((b.fzm[o] & 3) << FZ_SH);
+        fzF[i] = b.fz[o];
         mat[i] = b.mat[o]; grp[i] = b.grp[o];
       }
       const bondsU = new Uint32Array(nb * 4), bondsF = new Float32Array(bondsU.buffer);
@@ -665,6 +684,7 @@ var<workgroup> wc2: atomic<u32>;
         ev: mk(null, ST | S.COPY_SRC, EVCAP * 16),
         rb: mk(null, ST | S.COPY_SRC, (n - this.lo) * 16),
         rp: mk(null, ST | S.COPY_SRC, n * 4),
+        fz: mk(fzF, ST),
       };
       this.evOff = STATE_SIZE;
       this.rbOff = STATE_SIZE + EVCAP * 16;

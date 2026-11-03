@@ -147,7 +147,15 @@
     bullet: { name: 'AP rifle bullet', mat: 'hhs', D: 8, L: 32, v: 850 },
     sphere: { name: 'Sphere', mat: 'rha', D: 40, L: 40, v: 3000 },
     none: { name: 'None (drawn projectiles only)', mat: 'tungsten', D: 20, L: 100, v: 1500 },
+    // explosive shells: a steel case around an explosive fill. Dimensions and fuzes are illustrative.
+    hesh: { name: 'HESH (thin case, plastic explosive)', mat: 'mild', D: 75, L: 150, v: 800, fill: 'pe4', shell: 3, fuze: { type: 'delay', delay: 15 } },
+    he: { name: 'HE fragmentation shell', mat: 'mild', D: 100, L: 350, v: 600, fill: 'compb', shell: 8, fuze: { type: 'impact', delay: 0 } },
+    aphe: { name: 'APHE (base-fuzed, filled cavity)', mat: 'hhs', D: 100, L: 350, v: 850, fill: 'tnt', shell: 12, fuze: { type: 'delay', delay: 20 } },
   };
+  // Impact fuzes arm once the explosive is moving faster than ARM_SPEED and fire when its speed drops
+  // below IMPACT_DROP times its smoothed (shock) speed.
+  const ARM_SPEED = 2;     // units/t (200 m/s)
+  const IMPACT_DROP = 0.5;
 
   function projectileBodies(p, u) {
     const R = Math.max(0.6, u(p.D) / 2);
@@ -193,6 +201,26 @@
           mat: p.mat, x0: -Ls - 1, x1: -1, R: Rs,
           radius: (lx) => Rs * (0.5 + 0.5 * (lx + Ls + 1) / Ls),
           vel: () => vb * 0.6,
+        });
+        break;
+      }
+      case 'hesh':
+      case 'he':
+      case 'aphe': {
+        // case + explosive fill. The fill is the case profile minus the wall thickness; the base is closed.
+        const def = PROJECTILES[p.type] || {};
+        const fill = p.fill || def.fill, shellMm = p.shell ?? def.shell;
+        const t = Math.max(0.6, u(shellMm || 3));
+        const prof = ogive(R, L, Math.min(L * 0.4, 2 * R * 1.2));
+        const inner = (lx) => prof(lx) - t;
+        const fx0 = p.type === 'aphe' ? L * 0.45 : t, fx1 = L - t;
+        bodies.push({
+          mat: p.mat, x0: 0, x1: L, R, radius: prof, vel: () => v,
+          exclude: (lx, ly) => lx > t && lx < L - t && Math.abs(ly) < inner(lx) + 1e-6,
+        });
+        bodies.push({
+          mat: fill, x0: fx0, x1: fx1, R: R - t, vel: () => v, radius: (lx) => (lx < fx0 || lx > fx1 ? -1 : inner(lx)),
+          fuze: true,
         });
         break;
       }
@@ -331,7 +359,7 @@
     const fillFailed = [];
     let win = null, baseLab = null;
     (shapes || []).forEach((s, si) => {
-      if (!s.pts || !s.pts.length) return;
+      if (!s.pts || !s.pts.length || s.kind === 'det') return;
       let nodes = (fn) => forShapeNodes(s, res, fn);
       if (s.kind === 'fill') {
         // the window covers everything solid so far; empty space touching its edge is open
@@ -400,11 +428,12 @@
       const u = (mm) => mm / res;
       const rnd = mulberry32(1337);
       const J = 0.02;
-      const T = { x: [], y: [], vx: [], vy: [], mat: [], grp: [], body: [], pin: [] };
+      const T = { x: [], y: [], vx: [], vy: [], mat: [], grp: [], body: [], pin: [], fz: [], fzm: [] };
       let bodyId = 0;
       const add = (x, y, vx, vy, mat, grp, pin) => {
         T.x.push(x + (rnd() - 0.5) * J); T.y.push(y + (rnd() - 0.5) * J);
         T.vx.push(vx); T.vy.push(vy); T.mat.push(mat); T.grp.push(grp); T.body.push(bodyId); T.pin.push(pin ? 1 : 0);
+        T.fz.push(0); T.fzm.push(0); // fuze: mode 0 none, 1 armed on impact then delay, 2 absolute time
       };
 
       // ---- armor (local frame: x through thickness, y along plate) ----
@@ -455,6 +484,7 @@
 
       // ---- projectile ----
       const bodies = projectileBodies(scn.projectile, u);
+      const pFuze = scn.projectile.fuze || (PROJECTILES[scn.projectile.type] || {}).fuze || null;
       const maxR = Math.max(0, ...bodies.map((b) => b.R));
       let frontX = Infinity;
       for (let i = 0; i < T.x.length; i++) if (Math.abs(T.y[i]) < maxR + 1 && T.x[i] < frontX) frontX = T.x[i];
@@ -470,6 +500,13 @@
             const rad = b.radius(x);
             if (rad < 0 || Math.abs(y) > rad + 1e-6) continue;
             if (b.exclude && b.exclude(x, y)) continue;
+            if (b.fuze && MEXP[m] && pFuze && pFuze.type !== 'none') {
+              add(offX + x, offY + y, b.vel(x), 0, m, 1, false);
+              const k = T.x.length - 1;
+              T.fzm[k] = pFuze.type === 'time' ? 2 : 1;
+              T.fz[k] = Math.max(0, pFuze.delay || 0) / this.usPerT;
+              continue;
+            }
             add(offX + x, offY + y, b.vel(x), 0, m, 1, false);
           }
         }
@@ -528,6 +565,22 @@
         if (this.grp[i] === 1) this.projMass0 += MMASS[m];
       }
       this.expl = Int32Array.from(expl);
+      // fuzes: fz = delay in time units (mode 1, armed on impact) or absolute time (mode 2)
+      this.fz = Float64Array.from(T.fz);
+      this.fzm = Uint8Array.from(T.fzm);
+      for (const i of expl) if (this.fzm[i] === 2) { this.detT[i] = Math.min(this.detT[i], this.fz[i]); this.fzm[i] = 0; }
+      // detonator points: the explosive particles nearest the point fire at the detonator's delay
+      for (const s of scn.drawn || []) {
+        if (s.kind !== 'det' || !s.pts || !s.pts.length) continue;
+        const cx = s.pts[0][0] / res, cy = s.pts[0][1] / res;
+        let dmin = Infinity;
+        for (const i of expl) dmin = Math.min(dmin, Math.hypot(this.px[i] - cx, this.py[i] - cy));
+        if (!isFinite(dmin)) continue;
+        const t0 = Math.max(0, +s.delay || 0) / this.usPerT;
+        for (const i of expl) {
+          if (Math.hypot(this.px[i] - cx, this.py[i] - cy) <= dmin + 1.2) this.detT[i] = Math.min(this.detT[i], t0);
+        }
+      }
 
       // bounds
       let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
@@ -614,7 +667,7 @@
         for (let k = 0; k < m; k++) out[k] = arr[sorted[k]];
         return out;
       };
-      for (const key of ['px', 'py', 'vx', 'vy', 'mat', 'grp', 'body', 'alive', 'invm', 'heat', 'detT', 'uav', 'pres']) this[key] = perm(this[key]);
+      for (const key of ['px', 'py', 'vx', 'vy', 'mat', 'grp', 'body', 'alive', 'invm', 'heat', 'detT', 'uav', 'pres', 'fz', 'fzm']) this[key] = perm(this[key]);
       this.n = m;
       // explosive index list refers to storage positions, so it must be rebuilt after the permutation
       const exNew = [];
@@ -866,7 +919,7 @@
     // spreads to touching explosive particles. Initiation is either the smoothed particle speed of the
     // explosive (shock strength) passing the material's threshold, or a very high heat (cook-off).
     detonationsGas(dt) {
-      const { expl, alive, heat, detT, uav, vx, vy, px, py, mat, invm, sorted, cellStart, gw } = this;
+      const { expl, alive, heat, detT, uav, vx, vy, px, py, mat, invm, sorted, cellStart, gw, fz, fzm } = this;
       const now = this.time;
       const aTU = Math.min(1, dt / DET_TU);
       const fire = [];
@@ -874,7 +927,11 @@
         const i = expl[k];
         if (!alive[i] || !MEXP[mat[i]]) continue;
         const t = mat[i];
-        uav[i] += (Math.hypot(vx[i], vy[i]) - uav[i]) * aTU;
+        const sp = Math.hypot(vx[i], vy[i]);
+        uav[i] += (sp - uav[i]) * aTU;
+        // impact fuze: arms once moving fast, then delays firing when the speed drops sharply (target impact)
+        if (fzm[i] === 1 && uav[i] > ARM_SPEED) fzm[i] = 3;
+        if (fzm[i] === 3 && sp < IMPACT_DROP * uav[i]) { detT[i] = Math.min(detT[i], now + fz[i]); fzm[i] = 0; }
         if (detT[i] > now && (uav[i] > MUCRIT[t] || heat[i] > DET_HEAT_HI)) detT[i] = now;
         if (detT[i] <= now) fire.push(i);
       }

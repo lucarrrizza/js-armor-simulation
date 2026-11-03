@@ -23,7 +23,7 @@
   };
 
   // ---------- UI setup ----------
-  const pType = $('pType'), pMat = $('pMat'), preset = $('preset'), rows = $('layerRows');
+  const pType = $('pType'), pMat = $('pMat'), pFuze = $('pFuze'), pFuzeT = $('pFuzeT'), preset = $('preset'), rows = $('layerRows');
   for (const [k, p] of Object.entries(PROJECTILES)) pType.add(new Option(p.name, k));
   for (const m of PICKABLE) pMat.add(new Option(m.name, m.id));
   for (const [k, p] of Object.entries(PRESETS)) preset.add(new Option(p.name, k));
@@ -33,6 +33,7 @@
   function loadProjectileDefaults() {
     const p = PROJECTILES[pType.value];
     pMat.value = p.mat; $('pD').value = p.D; $('pL').value = p.L; $('pV').value = p.v;
+    pFuze.value = 'default'; pFuzeT.value = p.fuze ? p.fuze.delay || 0 : 0;
   }
   function loadPreset() {
     const p = PRESETS[preset.value];
@@ -75,7 +76,7 @@
   $('addLayer').onclick = () => { layers.push(L('rha', 50, 0)); renderRows(); markCustom(); };
   pType.onchange = () => { loadProjectileDefaults(); rebuild(); };
   preset.onchange = () => { loadPreset(); rebuild(); };
-  ['pMat', 'pD', 'pL', 'pV', 'pOff', 'res', 'plateH', 'explModel'].forEach((id) => $(id).addEventListener('change', rebuild));
+  ['pMat', 'pD', 'pL', 'pV', 'pOff', 'pFuze', 'pFuzeT', 'res', 'plateH', 'explModel'].forEach((id) => $(id).addEventListener('change', rebuild));
   $('angle').addEventListener('input', updateLabels);
   $('angle').addEventListener('change', rebuild);
   $('speed').addEventListener('input', updateLabels);
@@ -105,6 +106,9 @@
       projectile: {
         type: pType.value, mat: pMat.value,
         D: Math.max(1, +$('pD').value), L: Math.max(1, +$('pL').value), v: Math.max(1, +$('pV').value),
+        fuze: pFuze.value === 'default' ? null
+          : pFuze.value === 'none' ? { type: 'none' }
+            : { type: pFuze.value, delay: Math.max(0, +pFuzeT.value || 0) },
       },
     };
   }
@@ -855,6 +859,7 @@
     tool = t;
     for (const b of $('tools').children) b.classList.toggle('on', b.dataset.tool === t);
     canvas.classList.toggle('draw', t !== 'pan');
+    for (const el of document.querySelectorAll('.dDet')) el.style.display = t === 'det' ? '' : 'none';
   }
   for (const b of $('tools').children) b.onclick = () => setTool(b.dataset.tool);
 
@@ -894,11 +899,12 @@
   function startShape(e) {
     const p = eventMm(e);
     const erase = tool === 'erase';
-    const role = erase ? 'erase' : dRole.value;
     const [kind, outline] = TOOL_SHAPE[tool] || [tool];
+    const role = erase ? 'erase' : kind === 'det' ? 'det' : dRole.value;
     const s = { kind, role, size: Math.max(0.5, +$('dSize').value || 10), pts: [p] };
     if (outline) s.outline = true;
-    if (kind !== 'brush' && kind !== 'fill') s.pts.push(p.slice());
+    if (kind === 'det') s.delay = Math.max(0, +$('dDelay').value || 0);
+    else if (kind !== 'brush' && kind !== 'fill') s.pts.push(p.slice());
     if (role === 'armor' || role === 'projectile') s.mat = dMat.value;
     if (role === 'projectile') { s.v = Math.max(0, +$('dV').value || 0); s.dir = +$('dDir').value || 0; }
     return s;
@@ -906,6 +912,7 @@
 
   function extendShape(s, e) {
     let p = eventMm(e);
+    if (s.kind === 'det') return;
     if (s.kind === 'brush') {
       const q = s.pts[s.pts.length - 1];
       if (Math.hypot(p[0] - q[0], p[1] - q[1]) >= Math.max(0.5, s.size * 0.25)) s.pts.push(p);
@@ -942,7 +949,7 @@
     } else if (replay && replay.key !== JSON.stringify(scenario)) discardReplay();
   }
 
-  const ROLE_COL = { projectile: [255, 154, 60], anchor: [80, 200, 255], erase: [255, 80, 80] };
+  const ROLE_COL = { projectile: [255, 154, 60], anchor: [80, 200, 255], erase: [255, 80, 80], det: [255, 215, 70] };
   function shapeColor(s) { return ROLE_COL[s.role] || (MAT_BY_ID[s.mat] || MAT_BY_ID.rha).color; }
 
   function tracePath(s) {
@@ -967,6 +974,13 @@
   function drawShape(s, alpha) {
     const c = shapeColor(s).join(',');
     ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    if (s.kind === 'det') { // detonator: a ring with a centre dot
+      const [x, y] = worldToScreen(s.pts[0][0] / sim.res, s.pts[0][1] / sim.res);
+      ctx.strokeStyle = ctx.fillStyle = `rgba(${c},${alpha})`; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.arc(x, y, 7, 0, Math.PI * 2); ctx.stroke();
+      ctx.beginPath(); ctx.arc(x, y, 2.5, 0, Math.PI * 2); ctx.fill();
+      return;
+    }
     if (s.kind === 'fill') { // bucket seed: a small marker
       const [x, y] = worldToScreen(s.pts[0][0] / sim.res, s.pts[0][1] / sim.res);
       ctx.strokeStyle = `rgba(${c},${alpha})`; ctx.lineWidth = 1.5;

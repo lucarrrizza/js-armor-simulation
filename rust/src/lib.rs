@@ -186,6 +186,9 @@ struct State {
     c2t: *mut f64,
     // smoothed speed of each explosive particle (shock strength that initiates detonation)
     uav: *mut f64,
+    // impact/delay fuze per explosive particle: fire time offset (fz) and mode (fzm: 0 none, 1 unarmed, 3 armed)
+    fz: *mut f64,
+    fzm: *mut u8,
     // signed per-particle pressure (gas: EOS; solid: virial), and per-bond tension * length
     pres: *mut f32,
     bvir: *mut f32,
@@ -202,7 +205,7 @@ static mut S: State = State {
     ba: 0 as _, bb: 0 as _, brest: 0 as _, borig: 0 as _, bout: 0 as _, expl: 0 as _,
     gcnt: 0 as _, gslot: 0 as _, mt: 0 as _, events: 0 as _, v2t: 0 as _,
     scratch: 0 as _, order: 0 as _, inv: 0 as _, tmp: 0 as _, layout: 0 as _,
-    rho: 0 as _, pr: 0 as _, gx: 0 as _, gy: 0 as _, c2t: 0 as _, uav: 0 as _, pres: 0 as _, bvir: 0 as _, gas: false, gas_dt: f64::INFINITY,
+    rho: 0 as _, pr: 0 as _, gx: 0 as _, gy: 0 as _, c2t: 0 as _, uav: 0 as _, fz: 0 as _, fzm: 0 as _, pres: 0 as _, bvir: 0 as _, gas: false, gas_dt: f64::INFINITY,
 };
 
 static NEXT: AtomicU32 = AtomicU32::new(0);
@@ -325,6 +328,8 @@ pub unsafe extern "C" fn setup(
     }
     s.gas = false;
     s.gas_dt = f64::INFINITY;
+    s.fz = alloc(n);
+    s.fzm = alloc(n);
     s.scratch = alloc::<f64>(n) as *mut u8;
     s.order = alloc(n);
     s.inv = alloc(n);
@@ -333,11 +338,12 @@ pub unsafe extern "C" fn setup(
         return 0;
     }
     let l = s.layout;
-    let ptrs: [usize; 20] = [
+    let ptrs: [usize; 22] = [
         s.px as usize, s.py as usize, s.vx as usize, s.vy as usize, s.invm as usize, s.dett as usize,
         s.heat as usize, s.stress as usize, s.mat as usize, s.grp as usize, s.alive as usize,
         s.ba as usize, s.bb as usize, s.brest as usize, s.borig as usize, s.expl as usize,
         s.mt as usize, s.events as usize, s.uav as usize, s.pres as usize,
+        s.fz as usize, s.fzm as usize,
     ];
     for (k, p) in ptrs.iter().enumerate() {
         *l.add(k) = *p as u32;
@@ -430,6 +436,8 @@ unsafe fn reorder() {
     permute(s.alive, m);
     permute(s.uav, m);
     permute(s.pres, m);
+    permute(s.fz, m);
+    permute(s.fzm, m);
     s.n = m;
 
     // compact bonds
@@ -1088,6 +1096,10 @@ unsafe fn gas_force(s: &State, lo: usize, hi: usize) {
     }
 }
 
+// impact fuze thresholds (units/t); must match ARM_SPEED / IMPACT_DROP in sim.js
+const ARM_SPEED: f64 = 2.0;
+const IMPACT_DROP: f64 = 0.5;
+
 /// Gas model detonation (mirrors detonationsGas() in sim.js): a fired explosive becomes
 /// detonation products and stays in the simulation; the front only spreads to touching explosive.
 unsafe fn detonations_gas(s: &mut State) {
@@ -1108,6 +1120,14 @@ unsafe fn detonations_gas(s: &mut State) {
         let speed = sqrt(*s.vx.add(i) * *s.vx.add(i) + *s.vy.add(i) * *s.vy.add(i));
         let u = u + (speed - u) * atu;
         *s.uav.add(i) = u;
+        // impact fuze: arms once moving fast, then fires when the speed drops sharply (target impact)
+        if *s.fzm.add(i) == 1 && u > ARM_SPEED {
+            *s.fzm.add(i) = 3;
+        }
+        if *s.fzm.add(i) == 3 && speed < IMPACT_DROP * u {
+            *s.dett.add(i) = (*s.dett.add(i)).min(now + *s.fz.add(i));
+            *s.fzm.add(i) = 0;
+        }
         if *s.dett.add(i) > now && (u > *mt.add(MT_MUCRIT + t) || (*s.heat.add(i) as f64) > det_hi) {
             *s.dett.add(i) = now;
         }

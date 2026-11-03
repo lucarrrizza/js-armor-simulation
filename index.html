@@ -99,6 +99,7 @@
       <button data-tool="fill" title="G: fill the enclosed area or the body under the cursor">🪣 Bucket</button>
       <button data-tool="circle" title="C">● Circle fill</button>
       <button data-tool="circleO" title="Shift+C">○ Circle outline</button>
+      <button data-tool="det" title="Detonator: click to place one; the explosive nearest it fires after the delay">💥 Detonator</button>
       <button data-tool="erase" title="E">⌫ Eraser</button>
     </div>
     <label class="row"><span>Paint as</span>
@@ -111,6 +112,7 @@
     <label class="row"><span>Stroke width (mm)</span><input type="number" id="dSize" min="1" step="1" value="12"></label>
     <label class="row dProj"><span>Velocity (m/s)</span><input type="number" id="dV" min="0" step="50" value="1500"></label>
     <label class="row dProj"><span>Direction</span><input type="range" id="dDir" min="-180" max="180" step="5" value="0"><span class="val" id="dDirVal"></span></label>
+    <label class="row dDet"><span>Detonator delay (µs)</span><input type="number" id="dDelay" min="0" step="1" value="0"></label>
     <div class="btns"><button id="dUndo">Undo (Ctrl+Z)</button><button id="dClear">Clear drawing</button></div>
     <div id="dInfo" class="hint"></div>
 
@@ -121,6 +123,14 @@
     <label class="row"><span>Length (mm)</span><input type="number" id="pL" min="1" step="1"></label>
     <label class="row"><span>Velocity (m/s)</span><input type="number" id="pV" min="10" step="50"></label>
     <label class="row"><span>Aim offset (mm)</span><input type="number" id="pOff" step="5" value="0"></label>
+    <label class="row"><span>Fuze</span><select id="pFuze" title="Fuzes apply with the Gas (SPH) explosion model">
+      <option value="default">Per projectile</option>
+      <option value="none">None (no fuze)</option>
+      <option value="impact">Impact</option>
+      <option value="delay">Delay after impact</option>
+      <option value="time">Timed after launch</option>
+    </select></label>
+    <label class="row"><span>Fuze delay (µs)</span><input type="number" id="pFuzeT" min="0" step="1" value="0"></label>
 
     <h2>Armor</h2>
     <label class="row"><span>Preset</span><select id="preset"></select></label>

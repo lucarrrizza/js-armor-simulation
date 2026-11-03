@@ -53,7 +53,7 @@
       const L = X.setup(n, nb, b.expl.length, PHYS.NM, b.gw, b.gh, b.bx0, b.by0, b.bx1, b.by1);
       if (!L) throw new Error('out of WebAssembly memory - try a coarser resolution');
       const buf = this.memory.buffer;
-      const lay = new Uint32Array(buf, L, 20);
+      const lay = new Uint32Array(buf, L, 22);
       const F64 = (k, len) => new Float64Array(buf, lay[k], len);
       const F32 = (k, len) => new Float32Array(buf, lay[k], len);
       const U8 = (k, len) => new Uint8Array(buf, lay[k], len);
@@ -66,6 +66,8 @@
       F64(4, n).set(b.invm.subarray(0, n));
       this.detT = F64(5, n);
       this.detT.set(b.detT.subarray(0, n).map((t) => (t === Infinity ? 1e300 : t)));
+      this.fz = F64(20, n); this.fz.set(b.fz.subarray(0, n));
+      this.fzm = U8(21, n); this.fzm.set(b.fzm.subarray(0, n));
       this.heat.set(b.heat.subarray(0, n));
       this.mat.set(b.mat.subarray(0, n)); this.grp.set(b.grp.subarray(0, n)); this.alive.set(b.alive.subarray(0, n));
       U32(11, nb).set(b.ba.subarray(0, nb)); U32(12, nb).set(b.bb.subarray(0, nb));
