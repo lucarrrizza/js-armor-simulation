@@ -36,8 +36,93 @@ const MT_MCB: usize = 80;
 const MT_MEXP: usize = 96;
 const MT_KC: usize = 112;
 const MT_CC: usize = 368;
-const MT_CONST: usize = 624;
-const MT_LEN: usize = 640;
+const MT_CONST: usize = 624; // 32 slots: scalar constants (see C_* below)
+const MT_MGAS: usize = 656; // per-material flag: detonation products
+const MT_MDEN: usize = 672; // per-material flag: SPH density source (explosive or products)
+const MT_MMASS: usize = 688; // per-material mass
+const MT_LEN: usize = 704;
+
+// offsets inside the MT_CONST block (after the first 11 entries used by contacts/bonds/detonation)
+const C_H: usize = 11; // SPH smoothing length
+const C_SPHKW: usize = 12; // SPH 2D normalisation
+const C_GHI: usize = 13; // GAMMA_HI
+const C_GLO: usize = 14; // GAMMA_LO
+const C_RHO0: usize = 15;
+const C_P0: usize = 16;
+const C_RHOC: usize = 17;
+const C_PC: usize = 18;
+const C_GCUT: usize = 19; // smoke removal threshold (fraction of rho0)
+const C_DTOUCH: usize = 20; // detonation front reach
+const C_MP: usize = 21; // explosive mass (SPH particle mass)
+const C_PROD: usize = 22; // products material index
+const C_EXPL: usize = 23; // explosive material index
+
+const LN2: f64 = 0.693_147_180_559_945_3;
+
+// no_std has no powf/ln/exp: small, accurate versions for the gas equation of state.
+fn ln(x: f64) -> f64 {
+    let bits = x.to_bits();
+    let mut e = ((bits >> 52) & 0x7ff) as i64 - 1023;
+    let mut m = f64::from_bits((bits & 0x000f_ffff_ffff_ffff) | 0x3ff0_0000_0000_0000);
+    if m > core::f64::consts::SQRT_2 {
+        m *= 0.5;
+        e += 1;
+    }
+    let z = (m - 1.0) / (m + 1.0);
+    let z2 = z * z;
+    let mut term = z;
+    let mut sum = 0.0;
+    let mut k = 1.0;
+    for _ in 0..12 {
+        sum += term / k;
+        term *= z2;
+        k += 2.0;
+    }
+    2.0 * sum + e as f64 * LN2
+}
+
+fn exp(y: f64) -> f64 {
+    let t = y / LN2;
+    let k = if t >= 0.0 { (t + 0.5) as i64 } else { (t - 0.5) as i64 };
+    let r = y - k as f64 * LN2;
+    let mut term = 1.0;
+    let mut sum = 1.0;
+    for n in 1..25 {
+        term *= r / n as f64;
+        sum += term;
+    }
+    sum * f64::from_bits(((k + 1023) as u64) << 52)
+}
+
+#[inline(always)]
+fn pow(x: f64, y: f64) -> f64 {
+    exp(y * ln(x))
+}
+
+// SPH cubic spline kernel and its derivative, q = r / H (support 2)
+#[inline(always)]
+fn kw(q: f64) -> f64 {
+    if q < 1.0 {
+        1.0 - 1.5 * q * q + 0.75 * q * q * q
+    } else if q < 2.0 {
+        let t = 2.0 - q;
+        0.25 * t * t * t
+    } else {
+        0.0
+    }
+}
+
+#[inline(always)]
+fn dkw(q: f64) -> f64 {
+    if q < 1.0 {
+        -3.0 * q + 2.25 * q * q
+    } else if q < 2.0 {
+        let t = 2.0 - q;
+        -0.75 * t * t
+    } else {
+        0.0
+    }
+}
 
 struct State {
     n: usize,
@@ -90,6 +175,14 @@ struct State {
     inv: *mut i32,
     tmp: *mut u32,
     layout: *mut u32,
+    // gas model scratch: SPH density and pressure per particle, gas force per particle, per-thread max c^2
+    rho: *mut f64,
+    pr: *mut f64,
+    gx: *mut f64,
+    gy: *mut f64,
+    c2t: *mut f64,
+    gas: bool,
+    gas_dt: f64,
 }
 
 static mut S: State = State {
@@ -101,6 +194,7 @@ static mut S: State = State {
     ba: 0 as _, bb: 0 as _, brest: 0 as _, borig: 0 as _, bout: 0 as _, expl: 0 as _,
     gcnt: 0 as _, gslot: 0 as _, mt: 0 as _, events: 0 as _, v2t: 0 as _,
     scratch: 0 as _, order: 0 as _, inv: 0 as _, tmp: 0 as _, layout: 0 as _,
+    rho: 0 as _, pr: 0 as _, gx: 0 as _, gy: 0 as _, c2t: 0 as _, gas: false, gas_dt: f64::INFINITY,
 };
 
 static NEXT: AtomicU32 = AtomicU32::new(0);
@@ -210,6 +304,13 @@ pub unsafe extern "C" fn setup(
     s.mt = alloc(MT_LEN);
     s.events = alloc(EVCAP * 3);
     s.v2t = alloc(MAXT);
+    s.rho = alloc(n);
+    s.pr = alloc(n);
+    s.gx = alloc(n);
+    s.gy = alloc(n);
+    s.c2t = alloc(MAXT);
+    s.gas = false;
+    s.gas_dt = f64::INFINITY;
     s.scratch = alloc::<f64>(n) as *mut u8;
     s.order = alloc(n);
     s.inv = alloc(n);
@@ -407,6 +508,11 @@ pub unsafe extern "C" fn phase_begin(p: u32) {
             *s.v2t.add(t) = 0.0;
         }
     }
+    if p == 3 {
+        for t in 0..MAXT {
+            *s.c2t.add(t) = 0.0;
+        }
+    }
     NEXT.store(0, SeqCst);
 }
 
@@ -414,8 +520,12 @@ pub unsafe extern "C" fn phase_begin(p: u32) {
 #[no_mangle]
 pub unsafe extern "C" fn work(p: u32, tid: u32) {
     let s = st();
+    if (p == 3 || p == 4) && !s.gas {
+        return;
+    }
     let (total, ch) = if p == 1 { (s.nb, CH_B) } else { (s.n, CH_P) };
     let mut v2 = 0.0f64;
+    let mut c2 = 0.0f64;
     loop {
         let lo = NEXT.fetch_add(1, Relaxed) as usize * ch;
         if lo >= total {
@@ -425,16 +535,26 @@ pub unsafe extern "C" fn work(p: u32, tid: u32) {
         match p {
             0 => contacts(s, lo, hi),
             1 => bonds(s, lo, hi),
-            _ => {
+            2 => {
                 let v = integrate(s, lo, hi);
                 if v > v2 {
                     v2 = v;
                 }
             }
+            3 => {
+                let c = gas_density(s, lo, hi);
+                if c > c2 {
+                    c2 = c;
+                }
+            }
+            _ => gas_force(s, lo, hi),
         }
     }
     if p == 2 {
         *s.v2t.add(tid as usize % MAXT) = v2;
+    }
+    if p == 3 {
+        *s.c2t.add(tid as usize % MAXT) = c2;
     }
 }
 
@@ -452,8 +572,22 @@ pub unsafe extern "C" fn step_end() -> f64 {
     s.cur = 1 - s.cur;
     s.time += s.dt;
     s.steps += 1;
+    if s.gas {
+        let mut c2 = 0.0f64;
+        for t in 0..MAXT {
+            let c = *s.c2t.add(t);
+            if c > c2 {
+                c2 = c;
+            }
+        }
+        s.gas_dt = if c2 > 0.0 { 0.4 * *s.mt.add(MT_CONST + C_H) / sqrt(c2) } else { f64::INFINITY };
+    }
     if s.nexpl > 0 {
-        detonations(s);
+        if s.gas {
+            detonations_gas(s);
+        } else {
+            detonations(s);
+        }
     }
     sqrt(v2)
 }
@@ -479,6 +613,12 @@ unsafe fn contacts(s: &State, lo: usize, hi: usize) {
         if *s.alive.add(i) == 0 {
             continue;
         }
+        // detonation products take no contact forces (gas model)
+        if *mt.add(MT_MGAS + *s.mat.add(i) as usize) != 0.0 {
+            *s.fcx.add(i) = 0.0;
+            *s.fcy.add(i) = 0.0;
+            continue;
+        }
         let c = *s.pcell.add(i);
         if c < 0 || !in_grid(s, g + c as usize, i) {
             // overflowed its cell: neighbours can't see it, so it must not push them either
@@ -502,7 +642,7 @@ unsafe fn contacts(s: &State, lo: usize, hi: usize) {
                 let slots = s.gslot.add(cc * K);
                 for q in 0..cnt {
                     let j = *slots.add(q) as usize;
-                    if j == i || *s.alive.add(j) == 0 {
+                    if j == i || *s.alive.add(j) == 0 || *mt.add(MT_MGAS + *s.mat.add(j) as usize) != 0.0 {
                         continue;
                     }
                     let ddx = *s.px.add(j) - xi;
@@ -573,7 +713,11 @@ unsafe fn bonds(s: &State, lo: usize, hi: usize) {
         }
         let i = *s.ba.add(b) as usize;
         let j = *s.bb.add(b) as usize;
-        if *s.alive.add(i) == 0 || *s.alive.add(j) == 0 {
+        // bonds touching detonation products are removed (gas model)
+        if *s.alive.add(i) == 0 || *s.alive.add(j) == 0
+            || *mt.add(MT_MGAS + *s.mat.add(i) as usize) != 0.0
+            || *mt.add(MT_MGAS + *s.mat.add(j) as usize) != 0.0
+        {
             *s.borig.add(b) = -1.0;
             *out = 0.0;
             *out.add(1) = 0.0;
@@ -640,6 +784,10 @@ unsafe fn integrate(s: &State, lo: usize, hi: usize) -> f64 {
         }
         let mut fx = *s.fcx.add(i);
         let mut fy = *s.fcy.add(i);
+        if s.gas {
+            fx += *s.gx.add(i);
+            fy += *s.gy.add(i);
+        }
         let mut hb = 0.0f32;
         let mut smax = 0.0f32;
         let a = s.adj.add(i * ADJ);
@@ -773,6 +921,227 @@ unsafe fn detonations(s: &mut State) {
             s.nev += 1;
         }
     }
+}
+
+/// Visits every grid entry (alive particle) within `r` cells of (x, y), including the particle itself.
+#[inline(always)]
+unsafe fn stencil(s: &State, x: f64, y: f64, r: i32, mut f: impl FnMut(usize)) {
+    let g = s.cur * s.cells;
+    let ci = (x - s.gx0) as i32;
+    let cj = (y - s.gy0) as i32;
+    for dy in -r..=r {
+        let yy = cj + dy;
+        if yy < 0 || yy >= s.gh {
+            continue;
+        }
+        for dx in -r..=r {
+            let xx = ci + dx;
+            if xx < 0 || xx >= s.gw {
+                continue;
+            }
+            let cc = g + (xx + yy * s.gw) as usize;
+            let cnt = ((*s.gcnt.add(cc)).load(Relaxed) as usize).min(K);
+            let slots = s.gslot.add(cc * K);
+            for q in 0..cnt {
+                f(*slots.add(q) as usize);
+            }
+        }
+    }
+}
+
+/// Gas equation of state (mirrors pressure() in sim.js).
+#[inline(always)]
+unsafe fn gas_pressure(s: &State, rho: f64) -> f64 {
+    let mt = s.mt;
+    let rhoc = *mt.add(MT_CONST + C_RHOC);
+    if rho >= rhoc {
+        let q = rho / *mt.add(MT_CONST + C_RHO0);
+        *mt.add(MT_CONST + C_P0) * q * q * q
+    } else {
+        let q = rho / rhoc;
+        *mt.add(MT_CONST + C_PC) * pow(q, *mt.add(MT_CONST + C_GLO))
+    }
+}
+
+/// SPH density, pressure, sound speed and smoke removal for detonation products (phase 3).
+/// Returns the largest c^2 seen in [lo, hi).
+unsafe fn gas_density(s: &State, lo: usize, hi: usize) -> f64 {
+    let mt = s.mt;
+    let h = *mt.add(MT_CONST + C_H);
+    let h2 = 4.0 * h * h;
+    let sphkw = *mt.add(MT_CONST + C_SPHKW);
+    let mp = *mt.add(MT_CONST + C_MP);
+    let rhoc = *mt.add(MT_CONST + C_RHOC);
+    let ghi = *mt.add(MT_CONST + C_GHI);
+    let glo = *mt.add(MT_CONST + C_GLO);
+    let gcut = *mt.add(MT_CONST + C_GCUT) * *mt.add(MT_CONST + C_RHO0);
+    let mut c2max = 0.0f64;
+    for i in lo..hi {
+        if *s.alive.add(i) == 0 || *mt.add(MT_MGAS + *s.mat.add(i) as usize) == 0.0 {
+            continue;
+        }
+        let xi = *s.px.add(i);
+        let yi = *s.py.add(i);
+        // the particle's own kernel value kw(0) = 1 is counted here, so it is skipped below
+        let mut sum = 1.0f64;
+        stencil(s, xi, yi, 3, |j| {
+            if j == i || *mt.add(MT_MDEN + *s.mat.add(j) as usize) == 0.0 {
+                return;
+            }
+            let ex = *s.px.add(j) - xi;
+            let ey = *s.py.add(j) - yi;
+            let d2 = ex * ex + ey * ey;
+            if d2 < h2 {
+                sum += kw(sqrt(d2) / h);
+            }
+        });
+        let r = mp * sum * sphkw;
+        *s.rho.add(i) = r;
+        let p = gas_pressure(s, r);
+        *s.pr.add(i) = p;
+        let c2 = (if r >= rhoc { ghi } else { glo }) * p / r;
+        if c2 > c2max {
+            c2max = c2;
+        }
+        if r < gcut {
+            *s.alive.add(i) = 0;
+        }
+    }
+    c2max
+}
+
+/// SPH pair forces (phase 4). Gather form of the scatter loop in sim.js sph(): every alive
+/// product pushes each alive neighbour, and non-product neighbours get the reaction force.
+unsafe fn gas_force(s: &State, lo: usize, hi: usize) {
+    let mt = s.mt;
+    let h = *mt.add(MT_CONST + C_H);
+    let h2 = 4.0 * h * h;
+    let sphkw = *mt.add(MT_CONST + C_SPHKW);
+    let mp = *mt.add(MT_CONST + C_MP);
+    for i in lo..hi {
+        *s.gx.add(i) = 0.0;
+        *s.gy.add(i) = 0.0;
+        if *s.alive.add(i) == 0 {
+            continue;
+        }
+        let xi = *s.px.add(i);
+        let yi = *s.py.add(i);
+        let mi = *s.mat.add(i) as usize;
+        let self_gas = *mt.add(MT_MGAS + mi) != 0.0;
+        let s_self = if self_gas { *s.pr.add(i) / (*s.rho.add(i) * *s.rho.add(i)) } else { 0.0 };
+        let m_self = *mt.add(MT_MMASS + mi);
+        let mut fx = 0.0f64;
+        let mut fy = 0.0f64;
+        stencil(s, xi, yi, 3, |j| {
+            if j == i || *s.alive.add(j) == 0 {
+                return;
+            }
+            let mj = *s.mat.add(j) as usize;
+            let j_gas = *mt.add(MT_MGAS + mj) != 0.0;
+            // a non-product only receives forces from products
+            if !self_gas && !j_gas {
+                return;
+            }
+            let ex = *s.px.add(j) - xi;
+            let ey = *s.py.add(j) - yi;
+            let d2 = ex * ex + ey * ey;
+            if d2 >= h2 || d2 < 1e-12 {
+                return;
+            }
+            let d = sqrt(d2);
+            let dwdr = sphkw * dkw(d / h) / h; // <= 0
+            let sj = if j_gas { *s.pr.add(j) / (*s.rho.add(j) * *s.rho.add(j)) } else { 0.0 };
+            let k = if self_gas {
+                mp * *mt.add(MT_MMASS + mj) * (s_self + sj) * dwdr / d
+            } else {
+                mp * m_self * sj * dwdr / d
+            };
+            fx += k * ex;
+            fy += k * ey;
+        });
+        *s.gx.add(i) = fx;
+        *s.gy.add(i) = fy;
+    }
+}
+
+/// Gas model detonation (mirrors detonationsGas() in sim.js): a fired explosive becomes
+/// detonation products and stays in the simulation; the front only spreads to touching explosive.
+unsafe fn detonations_gas(s: &mut State) {
+    let mt = s.mt;
+    let det_heat = *mt.add(MT_CONST + 7) as f32;
+    let det_speed = *mt.add(MT_CONST + 8);
+    let dtouch = *mt.add(MT_CONST + C_DTOUCH);
+    let prod = *mt.add(MT_CONST + C_PROD) as u8;
+    let expl = *mt.add(MT_CONST + C_EXPL) as u8;
+    let now = s.time;
+    let mut nf = 0usize;
+    for k in 0..s.nexpl {
+        let i = *s.expl.add(k) as usize;
+        if *s.alive.add(i) == 0 || *s.mat.add(i) != expl {
+            continue;
+        }
+        if *s.heat.add(i) > det_heat && *s.dett.add(i) > now {
+            *s.dett.add(i) = now;
+        }
+        if *s.dett.add(i) <= now {
+            *s.order.add(nf) = i as u32;
+            nf += 1;
+        }
+    }
+    for f in 0..nf {
+        let i = *s.order.add(f) as usize;
+        *s.mat.add(i) = prod;
+        *s.invm.add(i) = 1.0 / *mt.add(MT_MMASS + prod as usize);
+        let xi = *s.px.add(i);
+        let yi = *s.py.add(i);
+        let dett = s.dett;
+        let mat = s.mat;
+        let alive = s.alive;
+        let px = s.px;
+        let py = s.py;
+        stencil(s, xi, yi, 2, |j| {
+            if *alive.add(j) == 0 || *mat.add(j) != expl {
+                return;
+            }
+            let ddx = *px.add(j) - xi;
+            let ddy = *py.add(j) - yi;
+            let d = sqrt(ddx * ddx + ddy * ddy);
+            if d > dtouch || d < 1e-6 {
+                return;
+            }
+            let t = now + d / det_speed;
+            if t < *dett.add(j) {
+                *dett.add(j) = t;
+            }
+        });
+        if i & 3 == 0 && s.nev < EVCAP {
+            let e = s.events.add(s.nev * 3);
+            *e = xi;
+            *e.add(1) = yi;
+            *e.add(2) = now;
+            s.nev += 1;
+        }
+    }
+    // drop burnt-out explosives from the candidate list
+    let mut w = 0usize;
+    for k in 0..s.nexpl {
+        let i = *s.expl.add(k) as usize;
+        if *s.alive.add(i) != 0 && *s.mat.add(i) == expl {
+            *s.expl.add(w) = i as u32;
+            w += 1;
+        }
+    }
+    s.nexpl = w;
+}
+
+#[no_mangle]
+pub extern "C" fn get_gas_dt() -> f64 {
+    st().gas_dt
+}
+
+#[no_mangle]
+pub extern "C" fn set_gas(on: u32) {
+    st().gas = on != 0;
 }
 
 #[no_mangle]

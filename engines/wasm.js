@@ -6,7 +6,8 @@
   const BASE = document.currentScript.src;
   const GEN = 0, PHASE = 1, DONE = 2, QUIT = 3;
   const STACK = 1 << 19;
-  const MT_LEN = 640;
+  const MT_LEN = 704;
+  const MT_MGAS = 656, MT_MDEN = 672, MT_MMASS = 688;
 
   class WasmSim {
     static available() {
@@ -79,8 +80,19 @@
       mt.set(P.KC, 112); mt.set(P.CC, 368);
       mt.set([P.R0, P.HEAT_V, P.HEAT_K, P.PLASTIC_HEAT, P.MIN_REST, P.BREAK_HEAT, P.FRICTION,
         P.DET_HEAT, P.DET_SPEED, P.BLAST_R, P.BLAST_J], 624);
+      // gas model constants: slots 11..23 of MT_CONST, see C_* in rust/src/lib.rs
+      const gas = P.GAS;
+      mt.set([P.H_SPH, P.SPH_KW, P.GAMMA_HI, P.GAMMA_LO, gas.rho0, gas.p0, gas.rhoc, gas.pc, P.GAS_CUT,
+        P.DET_TOUCH, P.MMASS[P.EXPL], P.PRODUCTS, P.EXPL], 624 + 11);
+      for (let m = 0; m < NM; m++) {
+        mt[MT_MGAS + m] = P.MGAS[m];
+        mt[MT_MDEN + m] = P.MDEN[m];
+      }
+      mt.set(P.MMASS, MT_MMASS);
       this.evView = F64(17, 4096 * 3);
       X.finalize();
+      this.gas = b.explosionModel === 'gas';
+      X.set_gas(this.gas ? 1 : 0);
       this.n = X.get_n(); this.nb = X.get_nb(); this.time = 0; this.events = [];
     }
 
@@ -102,9 +114,14 @@
       let remaining = us / this.usPerT;
       let steps = 0;
       while (remaining > 1e-9 && steps < maxSteps && (steps === 0 || performance.now() - t0 < budgetMs)) {
-        const dt = Math.min(this.dtStab, 0.15 / Math.max(1e-6, this.vmax), remaining);
+        const gasDt = this.gas ? X.get_gas_dt() : Infinity;
+        const dt = Math.min(this.dtStab, gasDt, 0.15 / Math.max(1e-6, this.vmax), remaining);
         X.step_begin(dt, Math.exp(-dt / 20));
         this.phase(0);
+        if (this.gas) {
+          this.phase(3); // SPH density and pressure
+          this.phase(4); // SPH pair forces
+        }
         this.phase(1);
         this.phase(2);
         this.vmax = X.step_end();

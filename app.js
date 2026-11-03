@@ -2,6 +2,7 @@
 (function () {
   const { Sim, MATS, MAT_BY_ID, PROJECTILES } = window.ImpactSim;
   const $ = (id) => document.getElementById(id);
+  const PICKABLE = MATS.filter((m) => !m.hidden); // detonation products only appear during a run
 
   const L = (mat, thick, gap = 0, fixed = true) => ({ mat, thick, gap, fixed });
   const PRESETS = {
@@ -24,7 +25,7 @@
   // ---------- UI setup ----------
   const pType = $('pType'), pMat = $('pMat'), preset = $('preset'), rows = $('layerRows');
   for (const [k, p] of Object.entries(PROJECTILES)) pType.add(new Option(p.name, k));
-  for (const m of MATS) pMat.add(new Option(m.name, m.id));
+  for (const m of PICKABLE) pMat.add(new Option(m.name, m.id));
   for (const [k, p] of Object.entries(PRESETS)) preset.add(new Option(p.name, k));
 
   let layers = [];
@@ -44,7 +45,7 @@
     layers.forEach((l, i) => {
       const tr = document.createElement('tr');
       const sel = document.createElement('select');
-      for (const m of MATS) sel.add(new Option(m.name, m.id));
+      for (const m of PICKABLE) sel.add(new Option(m.name, m.id));
       sel.value = l.mat;
       sel.onchange = () => { l.mat = sel.value; markCustom(); };
       const num = (key, min) => {
@@ -74,7 +75,7 @@
   $('addLayer').onclick = () => { layers.push(L('rha', 50, 0)); renderRows(); markCustom(); };
   pType.onchange = () => { loadProjectileDefaults(); rebuild(); };
   preset.onchange = () => { loadPreset(); rebuild(); };
-  ['pMat', 'pD', 'pL', 'pV', 'pOff', 'res', 'plateH'].forEach((id) => $(id).addEventListener('change', rebuild));
+  ['pMat', 'pD', 'pL', 'pV', 'pOff', 'res', 'plateH', 'explModel'].forEach((id) => $(id).addEventListener('change', rebuild));
   $('angle').addEventListener('input', updateLabels);
   $('angle').addEventListener('change', rebuild);
   $('speed').addEventListener('input', updateLabels);
@@ -95,6 +96,7 @@
   function scenarioFromUI() {
     return {
       res: +$('res').value,
+      explosionModel: $('explModel').value,
       angle: +$('angle').value,
       plateH: Math.max(20, +$('plateH').value),
       layers: layers.map((l) => Object.assign({}, l)),
@@ -833,7 +835,7 @@
   // ---------- drawing ----------
   // Shapes are kept in millimetres so they survive resolution changes; every edit rebuilds the scene.
   const dRole = $('dRole'), dMat = $('dMat');
-  for (const m of MATS) dMat.add(new Option(m.name, m.id));
+  for (const m of PICKABLE) dMat.add(new Option(m.name, m.id));
   const matByRole = { armor: 'rha', projectile: 'tungsten' };
   let tool = 'pan', drawing = null, hover = null;
 

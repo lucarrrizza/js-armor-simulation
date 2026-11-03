@@ -10,7 +10,9 @@
   const K = 6, ADJ = 8, NONE = 0xffffffff, EVCAP = 2048;
   const BATCH_MS = 40;
   const ALIVE = 256, FIRE = 512, INGRID = 1024;
-  const MT = { MK: 0, MY: 16, MFR: 32, MCR: 48, MMELT: 64, MCB: 80, MEXP: 96, KC: 112, CC: 368, CONST: 624, LEN: 640 };
+  // float layout shared with rust/src/lib.rs (MT_*) and engines/wasm.js; CONST+11..+23 hold the gas constants
+  const MT = { MK: 0, MY: 16, MFR: 32, MCR: 48, MMELT: 64, MCB: 80, MEXP: 96, KC: 112, CC: 368, CONST: 624,
+    MGAS: 656, MDEN: 672, MMASS: 688, LEN: 704 };
   const STATE_SIZE = 48;
 
   const HEADER = /* wgsl */`
@@ -24,15 +26,32 @@ const EVCAP: u32 = ${EVCAP}u;
 const MK: u32 = ${MT.MK}u; const MY: u32 = ${MT.MY}u; const MFR: u32 = ${MT.MFR}u; const MCR: u32 = ${MT.MCR}u;
 const MMELT: u32 = ${MT.MMELT}u; const MCB: u32 = ${MT.MCB}u; const MEXP: u32 = ${MT.MEXP}u;
 const KC: u32 = ${MT.KC}u; const CC: u32 = ${MT.CC}u; const CN: u32 = ${MT.CONST}u;
+const MGAS: u32 = ${MT.MGAS}u; const MDEN: u32 = ${MT.MDEN}u; const MMASS: u32 = ${MT.MMASS}u;
 struct Params {
   n: u32, nb: u32, nexpl: u32, gw: u32, gh: u32, cells: u32, nm: u32, lo: u32,
-  gx0: f32, gy0: f32, bx0: f32, by0: f32, bx1: f32, by1: f32, dtStab: f32, pad1: f32,
+  gx0: f32, gy0: f32, bx0: f32, by0: f32, bx1: f32, by1: f32, dtStab: f32, gas: u32,
 };
 struct State {
   dt: f32, time: f32, timeC: f32, remaining: f32,
   vacc: atomic<u32>, cur: u32, pending: u32, steps: u32,
-  fire: atomic<u32>, nev: atomic<u32>, broken: atomic<u32>, pad: u32,
+  fire: atomic<u32>, nev: atomic<u32>, broken: atomic<u32>, c2: atomic<u32>,
 };
+// cubic spline kernel (support 2), same as kw()/dkw() in sim.js
+fn kw(q: f32) -> f32 {
+  if (q < 1.0) { return 1.0 - 1.5 * q * q + 0.75 * q * q * q; }
+  if (q < 2.0) { let t = 2.0 - q; return 0.25 * t * t * t; }
+  return 0.0;
+}
+fn dkw(q: f32) -> f32 {
+  if (q < 1.0) { return -3.0 * q + 2.25 * q * q; }
+  if (q < 2.0) { let t = 2.0 - q; return -0.75 * t * t; }
+  return 0.0;
+}
+// gas equation of state, same as pressure() in sim.js
+fn gpress(rho: f32, rhoc: f32, rho0: f32, p0: f32, pc: f32, glo: f32) -> f32 {
+  if (rho >= rhoc) { let q = rho / rho0; return p0 * q * q * q; }
+  return pc * pow(rho / rhoc, glo);
+}
 `;
 
   // binding declarations; each pipeline lists the ones it uses
@@ -51,13 +70,19 @@ struct State {
     expl: ['read-only-storage', 'var<storage, read> expl: array<u32>;'],
     ev: ['storage', 'var<storage, read_write> ev: array<vec4<f32>>;'],
     rb: ['storage', 'var<storage, read_write> rb: array<vec4<u32>>;'],
+    pg: ['storage', 'var<storage, read_write> pg: array<vec2<f32>>;'], // gas: (SPH density, pressure)
   };
 
   const KERNELS = {
-    dt: [['P', 'st'], /* wgsl */`
+    dt: [['P', 'st', 'mt'], /* wgsl */`
 @compute @workgroup_size(1) fn main() {
   let v = sqrt(bitcast<f32>(atomicLoad(&st.vacc)));
-  let full = min(P.dtStab, 0.15 / max(1e-6, v));
+  var full = min(P.dtStab, 0.15 / max(1e-6, v));
+  // CFL limit of the detonation products, from the sound speed the previous step's pressure pass found
+  if (P.gas != 0u) {
+    let c2 = bitcast<f32>(atomicLoad(&st.c2));
+    if (c2 > 0.0) { full = min(full, 0.4 * mt[CN + 11u] / sqrt(c2)); }
+  }
   var dt = 0.0;
   // relative cutoff: f32 rounding of remaining must not cost an extra sliver step
   if (st.remaining > full * 1e-3) { dt = min(full, st.remaining); }
@@ -71,6 +96,7 @@ struct State {
     st.steps = st.steps + 1u;
     atomicStore(&st.vacc, 0u);
     atomicStore(&st.fire, 0u);
+    atomicStore(&st.c2, 0u);
   }
 }`],
 
@@ -95,6 +121,8 @@ struct State {
   if (dt == 0.0) { return; }
   let m = pm[i];
   if ((m.w & ALIVE) == 0u) { return; }
+  // detonation products take no contact forces (gas model)
+  if (mt[MGAS + (m.w & 255u)] != 0.0) { return; }
   let c = bitcast<i32>(m.z);
   // a particle that overflowed its grid cell is invisible to its neighbours, so it must not
   // push them either: one-sided contacts would act like a rocket on its fragment
@@ -114,7 +142,7 @@ struct State {
         let j = gslot[cc * K + s];
         if (j == i) { continue; }
         let mj = pm[j].w;
-        if ((mj & ALIVE) == 0u) { continue; }
+        if ((mj & ALIVE) == 0u || mt[MGAS + (mj & 255u)] != 0.0) { continue; }
         let q = pv[j];
         let dd = q.xy - p.xy;
         let d2 = dot(dd, dd);
@@ -157,7 +185,8 @@ struct State {
   }
   let i = bd.x; let j = bd.y;
   let fi = pm[i].w; let fj = pm[j].w;
-  if ((fi & fj & ALIVE) == 0u) {
+  // bonds touching detonation products are removed (gas model)
+  if ((fi & fj & ALIVE) == 0u || mt[MGAS + (fi & 255u)] != 0.0 || mt[MGAS + (fj & 255u)] != 0.0) {
     bonds[b].w = bitcast<u32>(-1.0);
     bout[b] = vec4<f32>(0.0, 0.0, 0.0, -1.0);
     atomicAdd(&st.broken, 1u);
@@ -241,6 +270,113 @@ fn one(i: u32, dt: f32) -> f32 {
   if (li == 0u) { atomicMax(&st.vacc, atomicLoad(&wmax)); }
 }`],
 
+    // gas model, same maths as gas_density()/gas_force() in rust/src/lib.rs. Each pass only writes its
+    // own particle, so the three passes are separate dispatches: density, then pressure (which also
+    // removes smoke), then the pair forces in gather form.
+    gasDensity: [['P', 'st', 'pv', 'pm', 'gcnt', 'gslot', 'mt', 'pg'], /* wgsl */`
+@compute @workgroup_size(${WG}) fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= P.n || P.gas == 0u || st.dt == 0.0) { return; }
+  let m = pm[i];
+  if ((m.w & ALIVE) == 0u || mt[MGAS + (m.w & 255u)] == 0.0) { return; }
+  let p = pv[i];
+  let h = mt[CN + 11u];
+  let h2 = 4.0 * h * h;
+  let ci = i32(p.x - P.gx0); let cj = i32(p.y - P.gy0);
+  // the particle's own kernel value kw(0) = 1
+  var sum = 1.0;
+  for (var dy = -3; dy <= 3; dy++) {
+    for (var dx = -3; dx <= 3; dx++) {
+      let X = ci + dx; let Y = cj + dy;
+      if (X < 0 || Y < 0 || X >= i32(P.gw) || Y >= i32(P.gh)) { continue; }
+      let cc = u32(X + Y * i32(P.gw));
+      let cnt = min(atomicLoad(&gcnt[cc]), K);
+      for (var s = 0u; s < cnt; s++) {
+        let j = gslot[cc * K + s];
+        if (j == i || mt[MDEN + (pm[j].w & 255u)] == 0.0) { continue; }
+        let dd = pv[j].xy - p.xy;
+        let d2 = dot(dd, dd);
+        if (d2 < h2) { sum += kw(sqrt(d2) / h); }
+      }
+    }
+  }
+  pg[i] = vec2<f32>(mt[CN + 21u] * sum * mt[CN + 12u], 0.0);
+}`],
+
+    gasPressure: [['P', 'st', 'pm', 'mt', 'pg'], /* wgsl */`
+var<workgroup> wc2: atomic<u32>;
+@compute @workgroup_size(${WG}) fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  if (li == 0u) { atomicStore(&wc2, 0u); }
+  workgroupBarrier();
+  let i = gid.x;
+  var c2 = 0.0;
+  if (i < P.n && P.gas != 0u && st.dt > 0.0) {
+    let m = pm[i];
+    if ((m.w & ALIVE) != 0u && mt[MGAS + (m.w & 255u)] != 0.0) {
+      let rho = pg[i].x;
+      let rhoc = mt[CN + 17u];
+      let p = gpress(rho, rhoc, mt[CN + 15u], mt[CN + 16u], mt[CN + 18u], mt[CN + 14u]);
+      pg[i] = vec2<f32>(rho, p);
+      c2 = select(mt[CN + 14u], mt[CN + 13u], rho >= rhoc) * p / rho;
+      if (rho < mt[CN + 19u] * mt[CN + 15u]) { pm[i].w = m.w & ~ALIVE; }
+    }
+  }
+  atomicMax(&wc2, bitcast<u32>(c2));
+  workgroupBarrier();
+  if (li == 0u) { atomicMax(&st.c2, atomicLoad(&wc2)); }
+}`],
+
+    gasForce: [['P', 'st', 'pv', 'pa', 'pm', 'gcnt', 'gslot', 'mt', 'pg'], /* wgsl */`
+@compute @workgroup_size(${WG}) fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= P.n || P.gas == 0u || st.dt == 0.0) { return; }
+  let m = pm[i];
+  if ((m.w & ALIVE) == 0u) { return; }
+  let mi = m.w & 255u;
+  let h = mt[CN + 11u];
+  let h2 = 4.0 * h * h;
+  let sphkw = mt[CN + 12u];
+  let mp = mt[CN + 21u];
+  let self_gas = mt[MGAS + mi] != 0.0;
+  let m_self = mt[MMASS + mi];
+  let p = pv[i];
+  var s_self = 0.0;
+  if (self_gas) { let gi = pg[i]; s_self = gi.y / (gi.x * gi.x); }
+  let ci = i32(p.x - P.gx0); let cj = i32(p.y - P.gy0);
+  var f = vec2<f32>(0.0, 0.0);
+  for (var dy = -3; dy <= 3; dy++) {
+    for (var dx = -3; dx <= 3; dx++) {
+      let X = ci + dx; let Y = cj + dy;
+      if (X < 0 || Y < 0 || X >= i32(P.gw) || Y >= i32(P.gh)) { continue; }
+      let cc = u32(X + Y * i32(P.gw));
+      let cnt = min(atomicLoad(&gcnt[cc]), K);
+      for (var s = 0u; s < cnt; s++) {
+        let j = gslot[cc * K + s];
+        if (j == i) { continue; }
+        let mj = pm[j].w;
+        if ((mj & ALIVE) == 0u) { continue; }
+        let mjm = mj & 255u;
+        let j_gas = mt[MGAS + mjm] != 0.0;
+        // a non-product only receives forces from products
+        if (!self_gas && !j_gas) { continue; }
+        let ex = pv[j].xy - p.xy;
+        let d2 = dot(ex, ex);
+        if (d2 >= h2 || d2 < 1e-12) { continue; }
+        let d = sqrt(d2);
+        let dwdr = sphkw * dkw(d / h) / h; // <= 0
+        var sj = 0.0;
+        if (j_gas) { let gj = pg[j]; sj = gj.y / (gj.x * gj.x); }
+        var k = 0.0;
+        if (self_gas) { k = mp * mt[MMASS + mjm] * (s_self + sj) * dwdr / d; }
+        else { k = mp * m_self * sj * dwdr / d; }
+        f += k * ex;
+      }
+    }
+  }
+  let a = pa[i];
+  pa[i] = vec4<f32>(a.xy + f, a.zw);
+}`],
+
     // single cell grid, rebuilt every step: clear the cells particles were in, then re-insert
     gclear: [['P', 'st', 'pm', 'gcnt'], /* wgsl */`
 @compute @workgroup_size(${WG}) fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -271,6 +407,8 @@ fn one(i: u32, dt: f32) -> f32 {
   let i = expl[k];
   let m = pm[i];
   if ((m.w & ALIVE) == 0u) { return; }
+  // detonation products (no longer explosive) must not fire again
+  if (mt[MEXP + (m.w & 255u)] == 0.0) { return; }
   let now = st.time;
   var dett = bitcast<f32>(m.y);
   if (pa[i].z > mt[CN + 7u] && dett > now) { dett = now; pm[i].y = bitcast<u32>(dett); }
@@ -287,8 +425,12 @@ fn one(i: u32, dt: f32) -> f32 {
   let pj = pv[j];
   let now = st.time;
   let ci = i32(pj.x - P.gx0); let cj = i32(pj.y - P.gy0);
-  let detSpeed = mt[CN + 8u]; let R = mt[CN + 9u]; let J = mt[CN + 10u];
+  let detSpeed = mt[CN + 8u]; let J = mt[CN + 10u];
+  // gas model: the front only spreads to touching explosive, with no blast kick on the rest
+  let gas = P.gas != 0u;
+  let R = select(mt[CN + 9u], mt[CN + 20u], gas);
   let isExp = mt[MEXP + (mj.w & 255u)] != 0.0;
+  if (gas && !isExp) { return; }
   var dett = bitcast<f32>(mj.y);
   var dv = vec2<f32>(0.0, 0.0);
   var dh = 0.0;
@@ -323,14 +465,21 @@ fn one(i: u32, dt: f32) -> f32 {
   }
 }`],
 
-    det3: [['P', 'st', 'pv', 'pm', 'expl', 'ev'], /* wgsl */`
+    det3: [['P', 'st', 'pv', 'pm', 'expl', 'ev', 'mt'], /* wgsl */`
 @compute @workgroup_size(${WG}) fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let k = gid.x;
   if (k >= P.nexpl || st.dt == 0.0) { return; }
   let i = expl[k];
   let w = pm[i].w;
   if ((w & FIRE) == 0u) { return; }
-  pm[i].w = w & ~(FIRE | ALIVE);
+  if (P.gas != 0u) {
+    // the explosive becomes detonation products, which stay in the simulation as gas
+    let prod = u32(mt[CN + 22u]);
+    pm[i].w = (w & ~(FIRE | 255u)) | prod;
+    pm[i].x = bitcast<u32>(1.0 / mt[MMASS + prod]);
+  } else {
+    pm[i].w = w & ~(FIRE | ALIVE);
+  }
   if ((i & 3u) == 0u) {
     let e = atomicAdd(&st.nev, 1u);
     if (e < EVCAP) { ev[e] = vec4<f32>(pv[i].xy, st.time, 0.0); }
@@ -463,9 +612,20 @@ fn one(i: u32, dt: f32) -> f32 {
       mt.set(P.KC, MT.KC); mt.set(P.CC, MT.CC);
       mt.set([P.R0, P.HEAT_V, P.HEAT_K, P.PLASTIC_HEAT, P.MIN_REST, P.BREAK_HEAT, P.FRICTION,
         P.DET_HEAT, P.DET_SPEED, P.BLAST_R, P.BLAST_J], MT.CONST);
+      // gas model constants: slots 11..23 of MT_CONST, see C_* in rust/src/lib.rs
+      const gas = P.GAS;
+      mt.set([P.H_SPH, P.SPH_KW, P.GAMMA_HI, P.GAMMA_LO, gas.rho0, gas.p0, gas.rhoc, gas.pc, P.GAS_CUT,
+        P.DET_TOUCH, P.MMASS[P.EXPL], P.PRODUCTS, P.EXPL], MT.CONST + 11);
+      for (let m = 0; m < P.NM; m++) {
+        mt[MT.MGAS + m] = P.MGAS[m];
+        mt[MT.MDEN + m] = P.MDEN[m];
+      }
+      mt.set(P.MMASS, MT.MMASS);
+      this.gas = b.explosionModel === 'gas';
       const params = new ArrayBuffer(64), pu = new Uint32Array(params), pf = new Float32Array(params);
       pu.set([n, nb, nexpl, b.gw, b.gh, cells, P.NM, this.lo]);
       pf.set([b.bx0 - 1, b.by0 - 1, b.bx0, b.by0, b.bx1, b.by1, b.dtStab, 0], 8);
+      pu[15] = this.gas ? 1 : 0;
       const state = new ArrayBuffer(STATE_SIZE), su = new Uint32Array(state);
       su[4] = new Uint32Array(new Float32Array([b.vmax * b.vmax]).buffer)[0];
 
@@ -487,6 +647,7 @@ fn one(i: u32, dt: f32) -> f32 {
         gslot: mk(null, ST, cells * K * 4),
         mt: mk(mt, ST),
         expl: mk(nexpl ? explP : null, ST, nexpl * 4),
+        pg: mk(null, ST, n * 8),
         ev: mk(null, ST | S.COPY_SRC, EVCAP * 16),
         rb: mk(null, ST | S.COPY_SRC, (n - this.lo) * 16),
       };
@@ -548,6 +709,11 @@ fn one(i: u32, dt: f32) -> f32 {
         pass.setBindGroup(0, this.groups.dt);
         pass.dispatchWorkgroups(1);
         this.dispatch(pass, 'contacts', n);
+        if (this.gas) {
+          this.dispatch(pass, 'gasDensity', n);
+          this.dispatch(pass, 'gasPressure', n);
+          this.dispatch(pass, 'gasForce', n);
+        }
         this.dispatch(pass, 'bonds', nb);
         this.dispatch(pass, 'integrate', n);
         this.dispatch(pass, 'gclear', n);
