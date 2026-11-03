@@ -18,6 +18,18 @@
   const DET_SPEED = 70;       // detonation velocity, units/t (7000 m/s)
   const BLAST_R = 2.6;
   const BLAST_J = 1.1;
+  // detonation products (gas model)
+  const H_SPH = 1.3;          // SPH smoothing length, in particle spacings
+  const GAMMA_HI = 3;         // isentrope exponent for dense products
+  const GAMMA_LO = 1.4;       // isentrope exponent for expanded products
+  const RHO_LO = 0.1;         // density fraction (of rho0) where the exponent changes
+  const GAS_E0 = 364;         // chemical energy per unit mass, (100 m/s)^2 units (Gurney-like)
+  const GAS_CUT = 0.01;       // products below this fraction of rho0 are removed as smoke
+  const DET_TOUCH = 1.2;      // the detonation front only spreads to touching explosive particles
+  const SPH_KW = 10 / (7 * Math.PI) / (H_SPH * H_SPH); // 2D cubic spline normalisation
+  // cubic spline kernel w(q) and its derivative, q = r / H_SPH, support 2
+  function kw(q) { return q < 1 ? 1 - 1.5 * q * q + 0.75 * q * q * q : q < 2 ? 0.25 * (2 - q) * (2 - q) * (2 - q) : 0; }
+  function dkw(q) { return q < 1 ? -3 * q + 2.25 * q * q : q < 2 ? -0.75 * (2 - q) * (2 - q) : 0; }
 
   const MATS = [
     { id: 'rha', name: 'RHA steel', density: 7.85, c: 5900, yield: 0.004, fracture: 0.30, crush: 9, melt: 1.0, color: [140, 150, 165] },
@@ -31,6 +43,8 @@
     { id: 'tungsten', name: 'Tungsten alloy', density: 17.5, c: 5000, yield: 0.007, fracture: 0.13, crush: 9, melt: 1.3, color: [132, 142, 214] },
     { id: 'du', name: 'Depleted uranium', density: 18.6, c: 3400, yield: 0.007, fracture: 0.08, crush: 9, melt: 1.0, color: [104, 176, 96] },
     { id: 'copper', name: 'Copper', density: 8.9, c: 4000, yield: 0.002, fracture: 3.0, crush: 9, melt: 2.0, color: [228, 136, 80] },
+    // not a user-selectable material: explosive particles become this once they detonate (gas model)
+    { id: 'products', name: 'Detonation products', density: 1.7, c: 4700, yield: 9, fracture: 0, crush: 9, melt: 9, color: [255, 128, 48], products: true, hidden: true },
   ];
   const NM = MATS.length;
   const MAT_BY_ID = {};
@@ -40,12 +54,32 @@
     m.k = m.m * Math.pow(m.c / 106, 2);
     MAT_BY_ID[m.id] = m;
   });
+  // reference state of the explosive for the gas model: density of the hex lattice (per unit area) and the isentrope
+  function latticeDensity() {
+    let s = 0;
+    for (let row = -8; row <= 8; row++) for (let col = -8; col <= 8; col++) {
+      s += kw(Math.hypot(col + (row & 1 ? 0.5 : 0), row * ROW) / H_SPH);
+    }
+    return s * SPH_KW;
+  }
+  const GAS = (() => {
+    const rho0 = MAT_BY_ID.explosive.m * latticeDensity();
+    const p0 = (GAMMA_HI - 1) * rho0 * GAS_E0;
+    return { rho0, p0, rhoc: RHO_LO * rho0, pc: p0 * Math.pow(RHO_LO, GAMMA_HI), c0: Math.sqrt(GAMMA_HI * p0 / rho0) };
+  })();
+  const PRODUCTS = MAT_BY_ID.products.index, EXPL = MAT_BY_ID.explosive.index;
+  function pressure(rho) {
+    return rho >= GAS.rhoc ? GAS.p0 * Math.pow(rho / GAS.rho0, GAMMA_HI) : GAS.pc * Math.pow(rho / GAS.rhoc, GAMMA_LO);
+  }
+
   const MK = new Float64Array(NM), MY = new Float64Array(NM), MFR = new Float64Array(NM),
-    MCR = new Float64Array(NM), MMELT = new Float64Array(NM), MCB = new Float64Array(NM), MMASS = new Float64Array(NM), MEXP = new Uint8Array(NM);
+    MCR = new Float64Array(NM), MMELT = new Float64Array(NM), MCB = new Float64Array(NM), MMASS = new Float64Array(NM), MEXP = new Uint8Array(NM),
+    MGAS = new Uint8Array(NM), MDEN = new Uint8Array(NM);
   const KC = new Float64Array(NM * NM), CC = new Float64Array(NM * NM);
   MATS.forEach((m, i) => {
     MK[i] = m.k; MY[i] = m.yield; MFR[i] = m.fracture; MCR[i] = m.crush; MMELT[i] = m.melt;
     MCB[i] = 0.12 * Math.sqrt(m.k * m.m); MMASS[i] = m.m; MEXP[i] = m.explosive ? 1 : 0;
+    MGAS[i] = m.products ? 1 : 0; MDEN[i] = MEXP[i] | MGAS[i];
   });
   for (let a = 0; a < NM; a++) for (let b = 0; b < NM; b++) {
     const k = Math.min(MK[a], MK[b]);
@@ -329,6 +363,7 @@
       const res = scn.res;
       this.res = res;
       this.usPerT = res * 10;
+      this.explosionModel = scn.explosionModel === 'simple' ? 'simple' : 'gas';
       const u = (mm) => mm / res;
       const rnd = mulberry32(1337);
       const J = 0.02;
@@ -491,6 +526,8 @@
       const present = new Set(T.mat);
       for (const m of present) this.dtStab = Math.min(this.dtStab, DT_FACTOR * 106 / MATS[m].c);
       if (!isFinite(this.dtStab)) this.dtStab = DT_FACTOR;
+      this.gasDt = Infinity; // CFL limit for detonation products, updated every step by sph()
+      this.rhoS = null; this.prS = null;
       this.updateVmax();
     }
 
@@ -585,6 +622,7 @@
       const n = this.n;
       this.fx.fill(0, 0, n); this.fy.fill(0, 0, n); this.stress.fill(0, 0, n);
       this.contacts(dt);
+      if (this.explosionModel === 'gas') this.sph();
       this.bonds();
       this.integrate(dt);
       this.time += dt;
@@ -592,14 +630,99 @@
       if (this.expl.length) this.detonations();
     }
 
+    // Detonation products (gas model). Density is an SPH sum over explosive-type particles; pressure
+    // follows the products isentrope. Each product pushes every neighbour within 2h, and non-product
+    // neighbours get the equal and opposite force, so momentum is conserved.
+    sph() {
+      const { sorted, nAlive, px, py, mat, alive, fx, fy, cellStart, gw, gh, cLo, cHi, n } = this;
+      if (!this.rhoS || this.rhoS.length < n) { this.rhoS = new Float64Array(n); this.prS = new Float64Array(n); }
+      const rho = this.rhoS, pr = this.prS;
+      const mP = MMASS[EXPL];
+      const H2 = (2 * H_SPH) * (2 * H_SPH);
+      const gas = [];
+      for (let a = 0; a < nAlive; a++) if (MGAS[mat[sorted[a]]]) gas.push(sorted[a]);
+      if (!gas.length) { this.gasDt = Infinity; return; }
+
+      // density (all products first, so pair terms use the same field on both sides)
+      for (const i of gas) {
+        const xi = px[i], yi = py[i];
+        const ci = (xi - this.bx0 + 1) | 0, cj = (yi - this.by0 + 1) | 0;
+        let s = 0;
+        for (let dy = -3; dy <= 3; dy++) {
+          const Y = cj + dy;
+          if (Y < 0 || Y >= gh) continue;
+          for (let dx = -3; dx <= 3; dx++) {
+            const X = ci + dx;
+            if (X < 0 || X >= gw) continue;
+            const cc = X + Y * gw;
+            if (cc < cLo || cc >= cHi) continue;
+            for (let b = cellStart[cc], e = cellStart[cc + 1]; b < e; b++) {
+              const j = sorted[b];
+              if (!MDEN[mat[j]]) continue;
+              const ex = px[j] - xi, ey = py[j] - yi, d2 = ex * ex + ey * ey;
+              if (d2 < H2) s += kw(Math.sqrt(d2) / H_SPH);
+            }
+          }
+        }
+        rho[i] = mP * s * SPH_KW;
+      }
+
+      // pressure, sound speed (CFL) and smoke removal
+      let cmax2 = 0;
+      for (const i of gas) {
+        const r = rho[i];
+        pr[i] = pressure(r);
+        const c2 = (r >= GAS.rhoc ? GAMMA_HI : GAMMA_LO) * pr[i] / r;
+        if (c2 > cmax2) cmax2 = c2;
+        if (r < GAS_CUT * GAS.rho0) alive[i] = 0;
+      }
+      this.gasDt = 0.4 * H_SPH / Math.sqrt(cmax2);
+
+      // pair forces: F_i = m_i m_j S dW/dr (x_i - x_j)/r with S = P_i/rho_i^2 (+ P_j/rho_j^2 for products)
+      for (const i of gas) {
+        if (!alive[i]) continue;
+        const xi = px[i], yi = py[i];
+        const Si = pr[i] / (rho[i] * rho[i]);
+        const ci = (xi - this.bx0 + 1) | 0, cj = (yi - this.by0 + 1) | 0;
+        let fxi = 0, fyi = 0;
+        for (let dy = -3; dy <= 3; dy++) {
+          const Y = cj + dy;
+          if (Y < 0 || Y >= gh) continue;
+          for (let dx = -3; dx <= 3; dx++) {
+            const X = ci + dx;
+            if (X < 0 || X >= gw) continue;
+            const cc = X + Y * gw;
+            if (cc < cLo || cc >= cHi) continue;
+            for (let b = cellStart[cc], e = cellStart[cc + 1]; b < e; b++) {
+              const j = sorted[b];
+              if (j === i || !alive[j]) continue;
+              const ex = px[j] - xi, ey = py[j] - yi, d2 = ex * ex + ey * ey;
+              if (d2 >= H2 || d2 < 1e-12) continue;
+              const d = Math.sqrt(d2);
+              const dwdr = SPH_KW * dkw(d / H_SPH) / H_SPH; // <= 0
+              let S = Si;
+              const gasJ = MGAS[mat[j]];
+              if (gasJ) S += pr[j] / (rho[j] * rho[j]);
+              const k = mP * MMASS[mat[j]] * S * dwdr / d;
+              fxi += k * ex; fyi += k * ey;
+              if (!gasJ) { fx[j] -= k * ex; fy[j] -= k * ey; }
+            }
+          }
+        }
+        fx[i] += fxi; fy[i] += fyi;
+      }
+    }
+
     contacts(dt) {
       const { px, py, vx, vy, fx, fy, mat, heat, sorted, cellStart, cellOf, gw } = this;
       const o1 = 1, o2 = gw - 1, o3 = gw, o4 = gw + 1;
 
       // ---- contacts (half stencil: own cell + E, SW, S, SE) ----
+      // detonation products take no contact forces; they interact through sph()
       const nAlive = this.nAlive;
       for (let a = 0; a < nAlive; a++) {
         const i = sorted[a];
+        if (MGAS[mat[i]]) continue;
         const xi = px[i], yi = py[i], vxi = vx[i], vyi = vy[i], mi = mat[i] * NM;
         const c = cellOf[i];
         let fxi = 0, fyi = 0, hi = 0;
@@ -609,6 +732,7 @@
           else { const cc = c + (q === 1 ? o1 : q === 2 ? o2 : q === 3 ? o3 : o4); b = cellStart[cc]; e = cellStart[cc + 1]; }
           for (; b < e; b++) {
             const j = sorted[b];
+            if (MGAS[mat[j]]) continue;
             const ddx = px[j] - xi, ddy = py[j] - yi;
             const d2 = ddx * ddx + ddy * ddy;
             if (d2 >= R0SQ || d2 < 1e-12) continue;
@@ -644,7 +768,7 @@
       let nb = this.nb;
       for (let b = 0; b < nb; b++) {
         const i = ba[b], j = bb[b];
-        if (!alive[i] || !alive[j]) { nb--; ba[b] = ba[nb]; bb[b] = bb[nb]; brest[b] = brest[nb]; borig[b] = borig[nb]; b--; continue; }
+        if (!alive[i] || !alive[j] || MGAS[mat[i]] || MGAS[mat[j]]) { nb--; ba[b] = ba[nb]; bb[b] = bb[nb]; brest[b] = brest[nb]; borig[b] = borig[nb]; b--; continue; }
         const m = mat[i];
         const ddx = px[j] - px[i], ddy = py[j] - py[i];
         const len = Math.sqrt(ddx * ddx + ddy * ddy) + 1e-12;
@@ -692,6 +816,51 @@
     }
 
     detonations() {
+      if (this.explosionModel === 'simple') this.detonationsSimple();
+      else this.detonationsGas();
+    }
+
+    // Gas model: a fired explosive becomes detonation products and stays in the sim. The front only
+    // spreads to touching explosive particles.
+    detonationsGas() {
+      const { expl, alive, heat, detT, px, py, mat, invm, sorted, cellStart, gw } = this;
+      const now = this.time;
+      const fire = [];
+      for (let k = 0; k < expl.length; k++) {
+        const i = expl[k];
+        if (!alive[i] || mat[i] !== EXPL) continue;
+        if (heat[i] > DET_HEAT && detT[i] > now) detT[i] = now;
+        if (detT[i] <= now) fire.push(i);
+      }
+      for (const i of fire) {
+        mat[i] = PRODUCTS;
+        invm[i] = 1 / MMASS[PRODUCTS];
+        const xi = px[i], yi = py[i];
+        const ci = ((xi - this.bx0 + 1) | 0), cj = ((yi - this.by0 + 1) | 0);
+        for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
+          const X = ci + dx, Y = cj + dy;
+          if (X < 0 || Y < 0 || X >= gw || Y >= this.gh) continue;
+          const cc = X + Y * gw;
+          if (cc < this.cLo || cc >= this.cHi) continue;
+          for (let b = cellStart[cc], e = cellStart[cc + 1]; b < e; b++) {
+            const j = sorted[b];
+            if (!alive[j] || mat[j] !== EXPL) continue;
+            const ddx = px[j] - xi, ddy = py[j] - yi;
+            const d = Math.sqrt(ddx * ddx + ddy * ddy);
+            if (d > DET_TOUCH || d < 1e-6) continue;
+            const t = now + d / DET_SPEED;
+            if (t < detT[j]) detT[j] = t;
+          }
+        }
+        if ((i & 3) === 0) this.events.push({ x: xi, y: yi, t: now });
+      }
+      let w = 0;
+      for (let k = 0; k < expl.length; k++) { const i = expl[k]; if (alive[i] && mat[i] === EXPL) expl[w++] = i; }
+      this.expl = expl.slice(0, w);
+    }
+
+    // Legacy model: instant removal and a radial blast kick on non-explosive neighbours.
+    detonationsSimple() {
       const { expl, alive, heat, detT, px, py, vx, vy, mat, invm, sorted, cellStart, gw } = this;
       const now = this.time;
       const fire = [];
@@ -738,7 +907,7 @@
       let remaining = us / this.usPerT;
       let steps = 0;
       while (remaining > 1e-9 && steps < maxSteps && (steps === 0 || performance.now() - t0 < budgetMs)) {
-        const dt = Math.min(this.dtStab, 0.15 / Math.max(1e-6, this.vmax), remaining);
+        const dt = Math.min(this.dtStab, this.gasDt, 0.15 / Math.max(1e-6, this.vmax), remaining);
         this.step(dt);
         remaining -= dt;
         steps++;
