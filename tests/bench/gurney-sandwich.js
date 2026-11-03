@@ -17,7 +17,8 @@ function run(res, te, tp = 5) {
   for (let i = 0; i < s.n; i++) if (s.mat[i] === E) { cx += s.px[i]; nE++; }
   cx /= nE;
   for (let i = 0; i < s.n; i++) if (s.mat[i] === E) { const d = Math.hypot(s.px[i] - cx, s.py[i]); if (d < bd) { bd = d; best = i; } }
-  s.heat[best] = 1;
+  // explicit detonator: schedule the centre particle to detonate now (same path a detonator tool will use)
+  s.detT[best] = 0;
   for (const us of [10, 30]) {
     s.advance(us - s.time * s.usPerT, 1e9, 1e9);
     let vL = 0, nL = 0, vR = 0, nR = 0, alive = 0;

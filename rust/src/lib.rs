@@ -26,36 +26,39 @@ const EVCAP: usize = 4096;
 const CH_P: usize = 512;
 const CH_B: usize = 2048;
 
-// material / constant table written by JS (f64)
+// Packed parameter table written by JS (f64). Layout is MTL in sim.js (PHYS.MTL); keep in sync.
+// Per-material tables have 32 slots each; pair tables are indexed a*NM+b.
 const MT_MK: usize = 0;
-const MT_MY: usize = 16;
-const MT_MFR: usize = 32;
-const MT_MCR: usize = 48;
-const MT_MMELT: usize = 64;
-const MT_MCB: usize = 80;
-const MT_MEXP: usize = 96;
-const MT_KC: usize = 112;
-const MT_CC: usize = 368;
-const MT_CONST: usize = 624; // 32 slots: scalar constants (see C_* below)
-const MT_MGAS: usize = 656; // per-material flag: detonation products
-const MT_MDEN: usize = 672; // per-material flag: SPH density source (explosive or products)
-const MT_MMASS: usize = 688; // per-material mass
-const MT_LEN: usize = 704;
+const MT_MY: usize = 32;
+const MT_MFR: usize = 64;
+const MT_MCR: usize = 96;
+const MT_MMELT: usize = 128;
+const MT_MCB: usize = 160;
+const MT_MEXP: usize = 192; // per-material flag: explosive
+const MT_MGAS: usize = 224; // per-material flag: detonation products
+const MT_MDEN: usize = 256; // per-material flag: SPH density source (explosive or products)
+const MT_MMASS: usize = 288;
+const MT_MUCRIT: usize = 320; // shock speed that initiates the explosive (units/t)
+const MT_MDSP: usize = 352; // detonation front speed
+const MT_GRHO0: usize = 384; // gas EOS per explosive (shared with its products twin)
+const MT_GP0: usize = 416;
+const MT_GRHOC: usize = 448;
+const MT_GPC: usize = 480;
+const MT_PROD: usize = 512; // explosive -> products material
+const MT_KC: usize = 544;
+const MT_CC: usize = 1568;
+const MT_CONST: usize = 2592; // scalar constants (see C_* below)
+const MT_LEN: usize = 2624;
 
-// offsets inside the MT_CONST block (after the first 11 entries used by contacts/bonds/detonation)
+// scalar slots inside the MT_CONST block
 const C_H: usize = 11; // SPH smoothing length
 const C_SPHKW: usize = 12; // SPH 2D normalisation
 const C_GHI: usize = 13; // GAMMA_HI
 const C_GLO: usize = 14; // GAMMA_LO
-const C_RHO0: usize = 15;
-const C_P0: usize = 16;
-const C_RHOC: usize = 17;
-const C_PC: usize = 18;
-const C_GCUT: usize = 19; // smoke removal threshold (fraction of rho0)
-const C_DTOUCH: usize = 20; // detonation front reach
-const C_MP: usize = 21; // explosive mass (SPH particle mass)
-const C_PROD: usize = 22; // products material index
-const C_EXPL: usize = 23; // explosive material index
+const C_GCUT: usize = 15; // smoke removal threshold (fraction of rho0)
+const C_DTOUCH: usize = 16; // detonation front reach
+const C_DETHI: usize = 17; // gas model heat cook-off threshold
+const C_DTU: usize = 18; // shock speed smoothing time
 
 const LN2: f64 = 0.693_147_180_559_945_3;
 
@@ -181,6 +184,8 @@ struct State {
     gx: *mut f64,
     gy: *mut f64,
     c2t: *mut f64,
+    // smoothed speed of each explosive particle (shock strength that initiates detonation)
+    uav: *mut f64,
     gas: bool,
     gas_dt: f64,
 }
@@ -194,7 +199,7 @@ static mut S: State = State {
     ba: 0 as _, bb: 0 as _, brest: 0 as _, borig: 0 as _, bout: 0 as _, expl: 0 as _,
     gcnt: 0 as _, gslot: 0 as _, mt: 0 as _, events: 0 as _, v2t: 0 as _,
     scratch: 0 as _, order: 0 as _, inv: 0 as _, tmp: 0 as _, layout: 0 as _,
-    rho: 0 as _, pr: 0 as _, gx: 0 as _, gy: 0 as _, c2t: 0 as _, gas: false, gas_dt: f64::INFINITY,
+    rho: 0 as _, pr: 0 as _, gx: 0 as _, gy: 0 as _, c2t: 0 as _, uav: 0 as _, gas: false, gas_dt: f64::INFINITY,
 };
 
 static NEXT: AtomicU32 = AtomicU32::new(0);
@@ -309,6 +314,10 @@ pub unsafe extern "C" fn setup(
     s.gx = alloc(n);
     s.gy = alloc(n);
     s.c2t = alloc(MAXT);
+    s.uav = alloc(n);
+    if !s.uav.is_null() {
+        core::ptr::write_bytes(s.uav as *mut u8, 0, n * core::mem::size_of::<f64>());
+    }
     s.gas = false;
     s.gas_dt = f64::INFINITY;
     s.scratch = alloc::<f64>(n) as *mut u8;
@@ -319,11 +328,11 @@ pub unsafe extern "C" fn setup(
         return 0;
     }
     let l = s.layout;
-    let ptrs: [usize; 18] = [
+    let ptrs: [usize; 19] = [
         s.px as usize, s.py as usize, s.vx as usize, s.vy as usize, s.invm as usize, s.dett as usize,
         s.heat as usize, s.stress as usize, s.mat as usize, s.grp as usize, s.alive as usize,
         s.ba as usize, s.bb as usize, s.brest as usize, s.borig as usize, s.expl as usize,
-        s.mt as usize, s.events as usize,
+        s.mt as usize, s.events as usize, s.uav as usize,
     ];
     for (k, p) in ptrs.iter().enumerate() {
         *l.add(k) = *p as u32;
@@ -414,6 +423,7 @@ unsafe fn reorder() {
     permute(s.mat, m);
     permute(s.grp, m);
     permute(s.alive, m);
+    permute(s.uav, m);
     s.n = m;
 
     // compact bonds
@@ -949,17 +959,17 @@ unsafe fn stencil(s: &State, x: f64, y: f64, r: i32, mut f: impl FnMut(usize)) {
     }
 }
 
-/// Gas equation of state (mirrors pressure() in sim.js).
+/// Gas equation of state for material t (mirrors pressure() in sim.js).
 #[inline(always)]
-unsafe fn gas_pressure(s: &State, rho: f64) -> f64 {
+unsafe fn gas_pressure(s: &State, rho: f64, t: usize) -> f64 {
     let mt = s.mt;
-    let rhoc = *mt.add(MT_CONST + C_RHOC);
+    let rhoc = *mt.add(MT_GRHOC + t);
     if rho >= rhoc {
-        let q = rho / *mt.add(MT_CONST + C_RHO0);
-        *mt.add(MT_CONST + C_P0) * q * q * q
+        let q = rho / *mt.add(MT_GRHO0 + t);
+        *mt.add(MT_GP0 + t) * q * q * q
     } else {
         let q = rho / rhoc;
-        *mt.add(MT_CONST + C_PC) * pow(q, *mt.add(MT_CONST + C_GLO))
+        *mt.add(MT_GPC + t) * pow(q, *mt.add(MT_CONST + C_GLO))
     }
 }
 
@@ -970,20 +980,19 @@ unsafe fn gas_density(s: &State, lo: usize, hi: usize) -> f64 {
     let h = *mt.add(MT_CONST + C_H);
     let h2 = 4.0 * h * h;
     let sphkw = *mt.add(MT_CONST + C_SPHKW);
-    let mp = *mt.add(MT_CONST + C_MP);
-    let rhoc = *mt.add(MT_CONST + C_RHOC);
     let ghi = *mt.add(MT_CONST + C_GHI);
     let glo = *mt.add(MT_CONST + C_GLO);
-    let gcut = *mt.add(MT_CONST + C_GCUT) * *mt.add(MT_CONST + C_RHO0);
+    let gcut = *mt.add(MT_CONST + C_GCUT);
     let mut c2max = 0.0f64;
     for i in lo..hi {
-        if *s.alive.add(i) == 0 || *mt.add(MT_MGAS + *s.mat.add(i) as usize) == 0.0 {
+        let mi = *s.mat.add(i) as usize;
+        if *s.alive.add(i) == 0 || *mt.add(MT_MGAS + mi) == 0.0 {
             continue;
         }
         let xi = *s.px.add(i);
         let yi = *s.py.add(i);
         // the particle's own kernel value kw(0) = 1 is counted here, so it is skipped below
-        let mut sum = 1.0f64;
+        let mut sum = *mt.add(MT_MMASS + mi);
         stencil(s, xi, yi, 3, |j| {
             if j == i || *mt.add(MT_MDEN + *s.mat.add(j) as usize) == 0.0 {
                 return;
@@ -992,18 +1001,18 @@ unsafe fn gas_density(s: &State, lo: usize, hi: usize) -> f64 {
             let ey = *s.py.add(j) - yi;
             let d2 = ex * ex + ey * ey;
             if d2 < h2 {
-                sum += kw(sqrt(d2) / h);
+                sum += *mt.add(MT_MMASS + *s.mat.add(j) as usize) * kw(sqrt(d2) / h);
             }
         });
-        let r = mp * sum * sphkw;
+        let r = sum * sphkw;
         *s.rho.add(i) = r;
-        let p = gas_pressure(s, r);
+        let p = gas_pressure(s, r, mi);
         *s.pr.add(i) = p;
-        let c2 = (if r >= rhoc { ghi } else { glo }) * p / r;
+        let c2 = (if r >= *mt.add(MT_GRHOC + mi) { ghi } else { glo }) * p / r;
         if c2 > c2max {
             c2max = c2;
         }
-        if r < gcut {
+        if r < gcut * *mt.add(MT_GRHO0 + mi) {
             *s.alive.add(i) = 0;
         }
     }
@@ -1017,7 +1026,6 @@ unsafe fn gas_force(s: &State, lo: usize, hi: usize) {
     let h = *mt.add(MT_CONST + C_H);
     let h2 = 4.0 * h * h;
     let sphkw = *mt.add(MT_CONST + C_SPHKW);
-    let mp = *mt.add(MT_CONST + C_MP);
     for i in lo..hi {
         *s.gx.add(i) = 0.0;
         *s.gy.add(i) = 0.0;
@@ -1052,9 +1060,10 @@ unsafe fn gas_force(s: &State, lo: usize, hi: usize) {
             let dwdr = sphkw * dkw(d / h) / h; // <= 0
             let sj = if j_gas { *s.pr.add(j) / (*s.rho.add(j) * *s.rho.add(j)) } else { 0.0 };
             let k = if self_gas {
-                mp * *mt.add(MT_MMASS + mj) * (s_self + sj) * dwdr / d
+                m_self * *mt.add(MT_MMASS + mj) * (s_self + sj) * dwdr / d
             } else {
-                mp * m_self * sj * dwdr / d
+                // reaction on a non-product from the product neighbour j
+                *mt.add(MT_MMASS + mj) * m_self * sj * dwdr / d
             };
             fx += k * ex;
             fy += k * ey;
@@ -1068,19 +1077,23 @@ unsafe fn gas_force(s: &State, lo: usize, hi: usize) {
 /// detonation products and stays in the simulation; the front only spreads to touching explosive.
 unsafe fn detonations_gas(s: &mut State) {
     let mt = s.mt;
-    let det_heat = *mt.add(MT_CONST + 7) as f32;
-    let det_speed = *mt.add(MT_CONST + 8);
+    let det_hi = *mt.add(MT_CONST + C_DETHI);
     let dtouch = *mt.add(MT_CONST + C_DTOUCH);
-    let prod = *mt.add(MT_CONST + C_PROD) as u8;
-    let expl = *mt.add(MT_CONST + C_EXPL) as u8;
+    let dtu = *mt.add(MT_CONST + C_DTU);
+    let atu = (s.dt / dtu).min(1.0);
     let now = s.time;
     let mut nf = 0usize;
     for k in 0..s.nexpl {
         let i = *s.expl.add(k) as usize;
-        if *s.alive.add(i) == 0 || *s.mat.add(i) != expl {
+        let t = *s.mat.add(i) as usize;
+        if *s.alive.add(i) == 0 || *mt.add(MT_MEXP + t) == 0.0 {
             continue;
         }
-        if *s.heat.add(i) > det_heat && *s.dett.add(i) > now {
+        let u = *s.uav.add(i);
+        let speed = sqrt(*s.vx.add(i) * *s.vx.add(i) + *s.vy.add(i) * *s.vy.add(i));
+        let u = u + (speed - u) * atu;
+        *s.uav.add(i) = u;
+        if *s.dett.add(i) > now && (u > *mt.add(MT_MUCRIT + t) || (*s.heat.add(i) as f64) > det_hi) {
             *s.dett.add(i) = now;
         }
         if *s.dett.add(i) <= now {
@@ -1090,6 +1103,8 @@ unsafe fn detonations_gas(s: &mut State) {
     }
     for f in 0..nf {
         let i = *s.order.add(f) as usize;
+        let t = *s.mat.add(i) as usize;
+        let prod = *mt.add(MT_PROD + t) as u8;
         *s.mat.add(i) = prod;
         *s.invm.add(i) = 1.0 / *mt.add(MT_MMASS + prod as usize);
         let xi = *s.px.add(i);
@@ -1100,7 +1115,8 @@ unsafe fn detonations_gas(s: &mut State) {
         let px = s.px;
         let py = s.py;
         stencil(s, xi, yi, 2, |j| {
-            if *alive.add(j) == 0 || *mat.add(j) != expl {
+            let mj = *mat.add(j) as usize;
+            if *alive.add(j) == 0 || *mt.add(MT_MEXP + mj) == 0.0 {
                 return;
             }
             let ddx = *px.add(j) - xi;
@@ -1109,7 +1125,7 @@ unsafe fn detonations_gas(s: &mut State) {
             if d > dtouch || d < 1e-6 {
                 return;
             }
-            let t = now + d / det_speed;
+            let t = now + d / *mt.add(MT_MDSP + mj);
             if t < *dett.add(j) {
                 *dett.add(j) = t;
             }
@@ -1126,7 +1142,7 @@ unsafe fn detonations_gas(s: &mut State) {
     let mut w = 0usize;
     for k in 0..s.nexpl {
         let i = *s.expl.add(k) as usize;
-        if *s.alive.add(i) != 0 && *s.mat.add(i) == expl {
+        if *s.alive.add(i) != 0 && *mt.add(MT_MEXP + *s.mat.add(i) as usize) != 0.0 {
             *s.expl.add(w) = i as u32;
             w += 1;
         }

@@ -10,9 +10,8 @@
   const K = 6, ADJ = 8, NONE = 0xffffffff, EVCAP = 2048;
   const BATCH_MS = 40;
   const ALIVE = 256, FIRE = 512, INGRID = 1024;
-  // float layout shared with rust/src/lib.rs (MT_*) and engines/wasm.js; CONST+11..+23 hold the gas constants
-  const MT = { MK: 0, MY: 16, MFR: 32, MCR: 48, MMELT: 64, MCB: 80, MEXP: 96, KC: 112, CC: 368, CONST: 624,
-    MGAS: 656, MDEN: 672, MMASS: 688, LEN: 704 };
+  // packed parameter table, same layout as rust/src/lib.rs (MT_*) and engines/wasm.js; see PHYS.packMT in sim.js
+  const MT = PHYS.MTL;
   const STATE_SIZE = 48;
 
   const HEADER = /* wgsl */`
@@ -27,6 +26,8 @@ const MK: u32 = ${MT.MK}u; const MY: u32 = ${MT.MY}u; const MFR: u32 = ${MT.MFR}
 const MMELT: u32 = ${MT.MMELT}u; const MCB: u32 = ${MT.MCB}u; const MEXP: u32 = ${MT.MEXP}u;
 const KC: u32 = ${MT.KC}u; const CC: u32 = ${MT.CC}u; const CN: u32 = ${MT.CONST}u;
 const MGAS: u32 = ${MT.MGAS}u; const MDEN: u32 = ${MT.MDEN}u; const MMASS: u32 = ${MT.MMASS}u;
+const MUCRIT: u32 = ${MT.MUCRIT}u; const MDSP: u32 = ${MT.MDSP}u; const MPROD: u32 = ${MT.PROD}u;
+const GRHO0: u32 = ${MT.GRHO0}u; const GP0: u32 = ${MT.GP0}u; const GRHOC: u32 = ${MT.GRHOC}u; const GPC: u32 = ${MT.GPC}u;
 struct Params {
   n: u32, nb: u32, nexpl: u32, gw: u32, gh: u32, cells: u32, nm: u32, lo: u32,
   gx0: f32, gy0: f32, bx0: f32, by0: f32, bx1: f32, by1: f32, dtStab: f32, gas: u32,
@@ -48,8 +49,8 @@ fn dkw(q: f32) -> f32 {
   return 0.0;
 }
 // gas equation of state, same as pressure() in sim.js
-fn gpress(rho: f32, rhoc: f32, rho0: f32, p0: f32, pc: f32, glo: f32) -> f32 {
-  if (rho >= rhoc) { let q = rho / rho0; return p0 * q * q * q; }
+fn gpress(rho: f32, rhoc: f32, rho0: f32, p0: f32, pc: f32, ghi: f32, glo: f32) -> f32 {
+  if (rho >= rhoc) { return p0 * pow(rho / rho0, ghi); }
   return pc * pow(rho / rhoc, glo);
 }
 `;
@@ -71,6 +72,7 @@ fn gpress(rho: f32, rhoc: f32, rho0: f32, p0: f32, pc: f32, glo: f32) -> f32 {
     ev: ['storage', 'var<storage, read_write> ev: array<vec4<f32>>;'],
     rb: ['storage', 'var<storage, read_write> rb: array<vec4<u32>>;'],
     pg: ['storage', 'var<storage, read_write> pg: array<vec2<f32>>;'], // gas: (SPH density, pressure)
+    uav: ['storage', 'var<storage, read_write> uav: array<f32>;'], // smoothed speed of each explosive, the shock driver
   };
 
   const KERNELS = {
@@ -283,8 +285,8 @@ fn one(i: u32, dt: f32) -> f32 {
   let h = mt[CN + 11u];
   let h2 = 4.0 * h * h;
   let ci = i32(p.x - P.gx0); let cj = i32(p.y - P.gy0);
-  // the particle's own kernel value kw(0) = 1
-  var sum = 1.0;
+  // the particle's own kernel value kw(0) = 1, weighted by its own mass
+  var sum = mt[MMASS + (m.w & 255u)];
   for (var dy = -3; dy <= 3; dy++) {
     for (var dx = -3; dx <= 3; dx++) {
       let X = ci + dx; let Y = cj + dy;
@@ -293,14 +295,15 @@ fn one(i: u32, dt: f32) -> f32 {
       let cnt = min(atomicLoad(&gcnt[cc]), K);
       for (var s = 0u; s < cnt; s++) {
         let j = gslot[cc * K + s];
-        if (j == i || mt[MDEN + (pm[j].w & 255u)] == 0.0) { continue; }
+        let mjm = pm[j].w & 255u;
+        if (j == i || mt[MDEN + mjm] == 0.0) { continue; }
         let dd = pv[j].xy - p.xy;
         let d2 = dot(dd, dd);
-        if (d2 < h2) { sum += kw(sqrt(d2) / h); }
+        if (d2 < h2) { sum += mt[MMASS + mjm] * kw(sqrt(d2) / h); }
       }
     }
   }
-  pg[i] = vec2<f32>(mt[CN + 21u] * sum * mt[CN + 12u], 0.0);
+  pg[i] = vec2<f32>(sum * mt[CN + 12u], 0.0);
 }`],
 
     gasPressure: [['P', 'st', 'pm', 'mt', 'pg'], /* wgsl */`
@@ -312,13 +315,14 @@ var<workgroup> wc2: atomic<u32>;
   var c2 = 0.0;
   if (i < P.n && P.gas != 0u && st.dt > 0.0) {
     let m = pm[i];
-    if ((m.w & ALIVE) != 0u && mt[MGAS + (m.w & 255u)] != 0.0) {
+    let mi = m.w & 255u;
+    if ((m.w & ALIVE) != 0u && mt[MGAS + mi] != 0.0) {
       let rho = pg[i].x;
-      let rhoc = mt[CN + 17u];
-      let p = gpress(rho, rhoc, mt[CN + 15u], mt[CN + 16u], mt[CN + 18u], mt[CN + 14u]);
+      let rhoc = mt[GRHOC + mi];
+      let p = gpress(rho, rhoc, mt[GRHO0 + mi], mt[GP0 + mi], mt[GPC + mi], mt[CN + 13u], mt[CN + 14u]);
       pg[i] = vec2<f32>(rho, p);
       c2 = select(mt[CN + 14u], mt[CN + 13u], rho >= rhoc) * p / rho;
-      if (rho < mt[CN + 19u] * mt[CN + 15u]) { pm[i].w = m.w & ~ALIVE; }
+      if (rho < mt[CN + 15u] * mt[GRHO0 + mi]) { pm[i].w = m.w & ~ALIVE; }
     }
   }
   atomicMax(&wc2, bitcast<u32>(c2));
@@ -336,7 +340,6 @@ var<workgroup> wc2: atomic<u32>;
   let h = mt[CN + 11u];
   let h2 = 4.0 * h * h;
   let sphkw = mt[CN + 12u];
-  let mp = mt[CN + 21u];
   let self_gas = mt[MGAS + mi] != 0.0;
   let m_self = mt[MMASS + mi];
   let p = pv[i];
@@ -366,10 +369,8 @@ var<workgroup> wc2: atomic<u32>;
         let dwdr = sphkw * dkw(d / h) / h; // <= 0
         var sj = 0.0;
         if (j_gas) { let gj = pg[j]; sj = gj.y / (gj.x * gj.x); }
-        var k = 0.0;
-        if (self_gas) { k = mp * mt[MMASS + mjm] * (s_self + sj) * dwdr / d; }
-        else { k = mp * m_self * sj * dwdr / d; }
-        f += k * ex;
+        // pair term m_i m_j (S_i + S_j) dW/dr, with S_j only for products; same as the scatter in sim.js
+        f += m_self * mt[MMASS + mjm] * (s_self + sj) * dwdr / d * ex;
       }
     }
   }
@@ -400,18 +401,26 @@ var<workgroup> wc2: atomic<u32>;
   pm[i].w = select(m.w & ~INGRID, m.w | INGRID, slot < K);
 }`],
 
-    det1: [['P', 'st', 'pa', 'pm', 'expl', 'mt'], /* wgsl */`
+    det1: [['P', 'st', 'pv', 'pa', 'pm', 'expl', 'mt', 'uav'], /* wgsl */`
 @compute @workgroup_size(${WG}) fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let k = gid.x;
   if (k >= P.nexpl || st.dt == 0.0) { return; }
   let i = expl[k];
   let m = pm[i];
   if ((m.w & ALIVE) == 0u) { return; }
+  let t = m.w & 255u;
   // detonation products (no longer explosive) must not fire again
-  if (mt[MEXP + (m.w & 255u)] == 0.0) { return; }
+  if (mt[MEXP + t] == 0.0) { return; }
   let now = st.time;
   var dett = bitcast<f32>(m.y);
-  if (pa[i].z > mt[CN + 7u] && dett > now) { dett = now; pm[i].y = bitcast<u32>(dett); }
+  if (P.gas != 0u) {
+    // gas model: the shock strength is the smoothed speed of the explosive, see detonationsGas in sim.js
+    let a = min(1.0, st.dt / mt[CN + 18u]);
+    uav[i] = uav[i] + (length(pv[i].zw) - uav[i]) * a;
+    if (dett > now && (uav[i] > mt[MUCRIT + t] || pa[i].z > mt[CN + 17u])) { dett = now; pm[i].y = bitcast<u32>(dett); }
+  } else if (pa[i].z > mt[CN + 7u] && dett > now) {
+    dett = now; pm[i].y = bitcast<u32>(dett);
+  }
   if (dett <= now) { pm[i].w = m.w | FIRE; atomicAdd(&st.fire, 1u); }
 }`],
 
@@ -425,11 +434,13 @@ var<workgroup> wc2: atomic<u32>;
   let pj = pv[j];
   let now = st.time;
   let ci = i32(pj.x - P.gx0); let cj = i32(pj.y - P.gy0);
-  let detSpeed = mt[CN + 8u]; let J = mt[CN + 10u];
-  // gas model: the front only spreads to touching explosive, with no blast kick on the rest
+  let mjm = mj.w & 255u;
+  let J = mt[CN + 10u];
+  // gas model: the front spreads to touching explosive at each material's own speed, with no blast kick on the rest
   let gas = P.gas != 0u;
-  let R = select(mt[CN + 9u], mt[CN + 20u], gas);
-  let isExp = mt[MEXP + (mj.w & 255u)] != 0.0;
+  let R = select(mt[CN + 9u], mt[CN + 16u], gas);
+  let detSpeed = select(mt[CN + 8u], mt[MDSP + mjm], gas);
+  let isExp = mt[MEXP + mjm] != 0.0;
   if (gas && !isExp) { return; }
   var dett = bitcast<f32>(mj.y);
   var dv = vec2<f32>(0.0, 0.0);
@@ -474,7 +485,7 @@ var<workgroup> wc2: atomic<u32>;
   if ((w & FIRE) == 0u) { return; }
   if (P.gas != 0u) {
     // the explosive becomes detonation products, which stay in the simulation as gas
-    let prod = u32(mt[CN + 22u]);
+    let prod = u32(mt[MPROD + (w & 255u)]);
     pm[i].w = (w & ~(FIRE | 255u)) | prod;
     pm[i].x = bitcast<u32>(1.0 / mt[MMASS + prod]);
   } else {
@@ -605,22 +616,8 @@ var<workgroup> wc2: atomic<u32>;
         put(i, k * 2); put(j, k * 2 + 1);
       }
       const explP = Uint32Array.from(b.expl, (i) => perm[i]);
-      const mt = new Float32Array(MT.LEN);
+      const mt = Float32Array.from(PHYS.packMT());
       const P = PHYS;
-      [P.MK, P.MY, P.MFR, P.MCR, P.MMELT, P.MCB].forEach((arr, k) => mt.set(arr, k * 16));
-      for (let m = 0; m < P.NM; m++) mt[MT.MEXP + m] = P.MEXP[m];
-      mt.set(P.KC, MT.KC); mt.set(P.CC, MT.CC);
-      mt.set([P.R0, P.HEAT_V, P.HEAT_K, P.PLASTIC_HEAT, P.MIN_REST, P.BREAK_HEAT, P.FRICTION,
-        P.DET_HEAT, P.DET_SPEED, P.BLAST_R, P.BLAST_J], MT.CONST);
-      // gas model constants: slots 11..23 of MT_CONST, see C_* in rust/src/lib.rs
-      const gas = P.GAS;
-      mt.set([P.H_SPH, P.SPH_KW, P.GAMMA_HI, P.GAMMA_LO, gas.rho0, gas.p0, gas.rhoc, gas.pc, P.GAS_CUT,
-        P.DET_TOUCH, P.MMASS[P.EXPL], P.PRODUCTS, P.EXPL], MT.CONST + 11);
-      for (let m = 0; m < P.NM; m++) {
-        mt[MT.MGAS + m] = P.MGAS[m];
-        mt[MT.MDEN + m] = P.MDEN[m];
-      }
-      mt.set(P.MMASS, MT.MMASS);
       this.gas = b.explosionModel === 'gas';
       const params = new ArrayBuffer(64), pu = new Uint32Array(params), pf = new Float32Array(params);
       pu.set([n, nb, nexpl, b.gw, b.gh, cells, P.NM, this.lo]);
@@ -648,6 +645,7 @@ var<workgroup> wc2: atomic<u32>;
         mt: mk(mt, ST),
         expl: mk(nexpl ? explP : null, ST, nexpl * 4),
         pg: mk(null, ST, n * 8),
+        uav: mk(null, ST, n * 4),
         ev: mk(null, ST | S.COPY_SRC, EVCAP * 16),
         rb: mk(null, ST | S.COPY_SRC, (n - this.lo) * 16),
       };

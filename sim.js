@@ -14,8 +14,12 @@
   const MIN_REST = 0.95;       // limits plastic compaction (metals are ~incompressible)
   const BREAK_HEAT = 0.08;
   const FRICTION = 0.1;
-  const DET_HEAT = 0.4;       // explosive initiation threshold
-  const DET_SPEED = 70;       // detonation velocity, units/t (7000 m/s)
+  const DET_HEAT = 0.4;       // explosive initiation threshold (simple model)
+  const DET_HEAT_HI = 1.9;    // gas model: heat cook-off, only very hot contact (integrator caps heat at 2)
+  const DET_SPEED = 70;       // detonation velocity, units/t (7000 m/s), simple model and ERA default
+  // shock initiation (gas model): an explosive particle's speed, smoothed over DET_TU, is its shock strength
+  const DET_UCRIT = 15;       // speed at which a sensitivity-1 explosive initiates, units/t (1.5 km/s)
+  const DET_TU = 0.3;         // speed smoothing time constant, units/t
   const BLAST_R = 2.6;
   const BLAST_J = 1.1;
   // detonation products (gas model)
@@ -31,7 +35,7 @@
   function kw(q) { return q < 1 ? 1 - 1.5 * q * q + 0.75 * q * q * q : q < 2 ? 0.25 * (2 - q) * (2 - q) * (2 - q) : 0; }
   function dkw(q) { return q < 1 ? -3 * q + 2.25 * q * q : q < 2 ? -0.75 * (2 - q) * (2 - q) : 0; }
 
-  const MATS = [
+  const MATS_SOLID = [
     { id: 'rha', name: 'RHA steel', density: 7.85, c: 5900, yield: 0.004, fracture: 0.30, crush: 9, melt: 1.0, color: [140, 150, 165] },
     { id: 'hhs', name: 'High-hardness steel', density: 7.85, c: 5900, yield: 0.006, fracture: 0.15, crush: 9, melt: 1.1, color: [92, 108, 138] },
     { id: 'mild', name: 'Mild steel', density: 7.85, c: 5900, yield: 0.002, fracture: 0.5, crush: 9, melt: 0.9, color: [172, 156, 134] },
@@ -39,13 +43,29 @@
     { id: 'glass', name: 'Glass / textolite', density: 2.5, c: 5000, yield: 9, fracture: 0.05, crush: 0.15, melt: 1.2, color: [110, 190, 178] },
     { id: 'alu', name: 'Aluminium alloy', density: 2.8, c: 5000, yield: 0.005, fracture: 0.4, crush: 9, melt: 0.7, color: [200, 213, 228] },
     { id: 'rubber', name: 'Rubber', density: 1.2, c: 1500, yield: 0.5, fracture: 2.0, crush: 9, melt: 0.8, color: [84, 78, 70] },
-    { id: 'explosive', name: 'Explosive (ERA)', density: 1.7, c: 2500, yield: 0.01, fracture: 0.3, crush: 9, melt: 1.0, color: [222, 186, 60], explosive: true },
     { id: 'tungsten', name: 'Tungsten alloy', density: 17.5, c: 5000, yield: 0.007, fracture: 0.13, crush: 9, melt: 1.3, color: [132, 142, 214] },
     { id: 'du', name: 'Depleted uranium', density: 18.6, c: 3400, yield: 0.007, fracture: 0.08, crush: 9, melt: 1.0, color: [104, 176, 96] },
     { id: 'copper', name: 'Copper', density: 8.9, c: 4000, yield: 0.002, fracture: 3.0, crush: 9, melt: 2.0, color: [228, 136, 80] },
-    // not a user-selectable material: explosive particles become this once they detonate (gas model)
-    { id: 'products', name: 'Detonation products', density: 1.7, c: 4700, yield: 9, fracture: 0, crush: 9, melt: 9, color: [255, 128, 48], products: true, hidden: true },
   ];
+  // explosives. v = sqrt(2E) in m/s (Comp B's 2700 is the GAS_E0 reference), D = detonation speed in units/t
+  // (10 units/t = 1 km/s), sens scales the shock-initiation thresholds (1 = reference)
+  const EXPLOSIVES = [
+    { id: 'explosive', name: 'Explosive (ERA)', density: 1.7, c: 2500, yield: 0.01, fracture: 0.3, crush: 9, melt: 1.0, color: [222, 186, 60], v: 2700, D: 70, sens: 1, explosive: true },
+    { id: 'compb', name: 'Comp B (RDX/TNT)', density: 1.72, c: 2500, yield: 0.01, fracture: 0.3, crush: 9, melt: 1.0, color: [196, 160, 96], v: 2700, D: 79, sens: 1, explosive: true },
+    { id: 'tnt', name: 'TNT', density: 1.65, c: 2400, yield: 0.01, fracture: 0.2, crush: 9, melt: 1.0, color: [214, 178, 98], v: 2370, D: 69, sens: 0.7, explosive: true },
+    { id: 'pe4', name: 'PE4 / C4 (plastic)', density: 1.6, c: 2000, yield: 0.03, fracture: 1.0, crush: 9, melt: 0.9, color: [236, 220, 140], v: 2600, D: 80, sens: 0.8, explosive: true },
+    { id: 'hmx', name: 'HMX / octol', density: 1.9, c: 2600, yield: 0.012, fracture: 0.3, crush: 9, melt: 1.0, color: [150, 122, 70], v: 2900, D: 88, sens: 1.2, explosive: true },
+    { id: 'petn', name: 'PETN', density: 1.77, c: 2500, yield: 0.01, fracture: 0.3, crush: 9, melt: 0.9, color: [240, 224, 160], v: 2800, D: 83, sens: 1.5, explosive: true },
+    { id: 'anfo', name: 'ANFO', density: 0.85, c: 1200, yield: 0.002, fracture: 0.1, crush: 9, melt: 0.8, color: [196, 176, 128], v: 1900, D: 45, sens: 0.2, explosive: true },
+    { id: 'ammonal', name: 'Aluminised (H6 / Tritonal)', density: 1.75, c: 2400, yield: 0.01, fracture: 0.3, crush: 9, melt: 1.0, color: [160, 150, 140], v: 2200, D: 65, sens: 0.6, explosive: true },
+  ];
+  // hidden detonation-product twin of each explosive: carries that explosive's gas EOS (see GRHO0 etc.)
+  // and is not user-selectable. The ERA twin keeps the id 'products' for compatibility.
+  const PRODUCT_MATS = EXPLOSIVES.map((e) => ({
+    id: e.id === 'explosive' ? 'products' : 'prod_' + e.id,
+    name: e.id === 'explosive' ? 'Detonation products' : 'Products: ' + e.name,
+    density: e.density, c: 4700, yield: 9, fracture: 0, crush: 9, melt: 9, color: [255, 128, 48], products: true, hidden: true,     twinOf: e.id,
+  }));  const MATS = [...MATS_SOLID, ...EXPLOSIVES, ...PRODUCT_MATS];
   const NM = MATS.length;
   const MAT_BY_ID = {};
   MATS.forEach((m, i) => {
@@ -62,14 +82,27 @@
     }
     return s * SPH_KW;
   }
-  const GAS = (() => {
-    const rho0 = MAT_BY_ID.explosive.m * latticeDensity();
-    const p0 = (GAMMA_HI - 1) * rho0 * GAS_E0;
-    return { rho0, p0, rhoc: RHO_LO * rho0, pc: p0 * Math.pow(RHO_LO, GAMMA_HI), c0: Math.sqrt(GAMMA_HI * p0 / rho0) };
-  })();
-  const PRODUCTS = MAT_BY_ID.products.index, EXPL = MAT_BY_ID.explosive.index;
-  function pressure(rho) {
-    return rho >= GAS.rhoc ? GAS.p0 * Math.pow(rho / GAS.rho0, GAMMA_HI) : GAS.pc * Math.pow(rho / GAS.rhoc, GAMMA_LO);
+  // per-material gas tables. Each explosive and its product twin share one EOS:
+  // rho0 = reference density, p0 = pressure at rho0, rhoc/pc = where the isentrope exponent changes
+  const GRHO0 = new Float64Array(NM), GP0 = new Float64Array(NM), GRHOC = new Float64Array(NM), GPC = new Float64Array(NM);
+  const MDSP = new Float64Array(NM), MUCRIT = new Float64Array(NM);
+  const PROD_OF = new Int32Array(NM).fill(-1);
+  {
+    const LAT = latticeDensity();
+    for (const e of EXPLOSIVES) {
+      const ex = MAT_BY_ID[e.id], tw = MAT_BY_ID[e.id === 'explosive' ? 'products' : 'prod_' + e.id];
+      const rho0 = ex.m * LAT;
+      const p0 = (GAMMA_HI - 1) * rho0 * GAS_E0 * Math.pow(e.v / 2700, 2);
+      const rhoc = RHO_LO * rho0, pc = p0 * Math.pow(RHO_LO, GAMMA_HI);
+      for (const k of [ex.index, tw.index]) {
+        GRHO0[k] = rho0; GP0[k] = p0; GRHOC[k] = rhoc; GPC[k] = pc;
+        MDSP[k] = e.D; MUCRIT[k] = DET_UCRIT / e.sens;
+      }
+      PROD_OF[ex.index] = tw.index;
+    }
+  }
+  function pressure(rho, t) {
+    return rho >= GRHOC[t] ? GP0[t] * Math.pow(rho / GRHO0[t], GAMMA_HI) : GPC[t] * Math.pow(rho / GRHOC[t], GAMMA_LO);
   }
 
   const MK = new Float64Array(NM), MY = new Float64Array(NM), MFR = new Float64Array(NM),
@@ -481,6 +514,7 @@
       this.invm = new Float64Array(n);
       this.heat = new Float32Array(n); this.stress = new Float32Array(n);
       this.detT = new Float64Array(n).fill(Infinity);
+      this.uav = new Float64Array(n);  // smoothed speed of explosive particles (shock strength), persists across steps
       this.cellOf = new Int32Array(n); this.sorted = new Int32Array(n);
       const expl = [];
       this.projMass0 = 0;
@@ -577,8 +611,12 @@
         for (let k = 0; k < m; k++) out[k] = arr[sorted[k]];
         return out;
       };
-      for (const key of ['px', 'py', 'vx', 'vy', 'mat', 'grp', 'body', 'alive', 'invm', 'heat', 'detT']) this[key] = perm(this[key]);
+      for (const key of ['px', 'py', 'vx', 'vy', 'mat', 'grp', 'body', 'alive', 'invm', 'heat', 'detT', 'uav']) this[key] = perm(this[key]);
       this.n = m;
+      // explosive index list refers to storage positions, so it must be rebuilt after the permutation
+      const exNew = [];
+      for (let i = 0; i < m; i++) if (this.alive[i] && MEXP[this.mat[i]]) exNew.push(i);
+      this.expl = Int32Array.from(exNew);
       if (this.ba) {
         const { ba, bb, brest, borig } = this;
         let w = 0;
@@ -589,9 +627,6 @@
         }
         this.nb = w;
       }
-      const ex = [];
-      for (const i of this.expl) if (inv[i] >= 0) ex.push(inv[i]);
-      this.expl = Int32Array.from(ex);
       for (let k = 0; k < m; k++) sorted[k] = k;
       for (let k = 0; k < m; k++) this.cellOf[k] = -1;
       this.buildGrid();
@@ -627,17 +662,16 @@
       this.integrate(dt);
       this.time += dt;
       this.steps++;
-      if (this.expl.length) this.detonations();
+      if (this.expl.length) this.detonations(dt);
     }
 
     // Detonation products (gas model). Density is an SPH sum over explosive-type particles; pressure
-    // follows the products isentrope. Each product pushes every neighbour within 2h, and non-product
-    // neighbours get the equal and opposite force, so momentum is conserved.
+    // follows the isentrope of each explosive's products. Each product pushes every neighbour within 2h,
+    // and non-product neighbours get the equal and opposite force, so momentum is conserved.
     sph() {
       const { sorted, nAlive, px, py, mat, alive, fx, fy, cellStart, gw, gh, cLo, cHi, n } = this;
       if (!this.rhoS || this.rhoS.length < n) { this.rhoS = new Float64Array(n); this.prS = new Float64Array(n); }
       const rho = this.rhoS, pr = this.prS;
-      const mP = MMASS[EXPL];
       const H2 = (2 * H_SPH) * (2 * H_SPH);
       const gas = [];
       for (let a = 0; a < nAlive; a++) if (MGAS[mat[sorted[a]]]) gas.push(sorted[a]);
@@ -660,21 +694,21 @@
               const j = sorted[b];
               if (!MDEN[mat[j]]) continue;
               const ex = px[j] - xi, ey = py[j] - yi, d2 = ex * ex + ey * ey;
-              if (d2 < H2) s += kw(Math.sqrt(d2) / H_SPH);
+              if (d2 < H2) s += MMASS[mat[j]] * kw(Math.sqrt(d2) / H_SPH);
             }
           }
         }
-        rho[i] = mP * s * SPH_KW;
+        rho[i] = s * SPH_KW;
       }
 
       // pressure, sound speed (CFL) and smoke removal
       let cmax2 = 0;
       for (const i of gas) {
-        const r = rho[i];
-        pr[i] = pressure(r);
-        const c2 = (r >= GAS.rhoc ? GAMMA_HI : GAMMA_LO) * pr[i] / r;
+        const r = rho[i], t = mat[i];
+        pr[i] = pressure(r, t);
+        const c2 = (r >= GRHOC[t] ? GAMMA_HI : GAMMA_LO) * pr[i] / r;
         if (c2 > cmax2) cmax2 = c2;
-        if (r < GAS_CUT * GAS.rho0) alive[i] = 0;
+        if (r < GAS_CUT * GRHO0[t]) alive[i] = 0;
       }
       this.gasDt = 0.4 * H_SPH / Math.sqrt(cmax2);
 
@@ -682,7 +716,7 @@
       for (const i of gas) {
         if (!alive[i]) continue;
         const xi = px[i], yi = py[i];
-        const Si = pr[i] / (rho[i] * rho[i]);
+        const Si = pr[i] / (rho[i] * rho[i]), mi = MMASS[mat[i]];
         const ci = (xi - this.bx0 + 1) | 0, cj = (yi - this.by0 + 1) | 0;
         let fxi = 0, fyi = 0;
         for (let dy = -3; dy <= 3; dy++) {
@@ -703,7 +737,7 @@
               let S = Si;
               const gasJ = MGAS[mat[j]];
               if (gasJ) S += pr[j] / (rho[j] * rho[j]);
-              const k = mP * MMASS[mat[j]] * S * dwdr / d;
+              const k = mi * MMASS[mat[j]] * S * dwdr / d;
               fxi += k * ex; fyi += k * ey;
               if (!gasJ) { fx[j] -= k * ex; fy[j] -= k * ey; }
             }
@@ -815,26 +849,30 @@
       this.vmax = Math.sqrt(v2max);
     }
 
-    detonations() {
+    detonations(dt) {
       if (this.explosionModel === 'simple') this.detonationsSimple();
-      else this.detonationsGas();
+      else this.detonationsGas(dt);
     }
 
-    // Gas model: a fired explosive becomes detonation products and stays in the sim. The front only
-    // spreads to touching explosive particles.
-    detonationsGas() {
-      const { expl, alive, heat, detT, px, py, mat, invm, sorted, cellStart, gw } = this;
+    // Gas model: a fired explosive becomes its detonation products and stays in the sim. The front only
+    // spreads to touching explosive particles. Initiation is either the smoothed particle speed of the
+    // explosive (shock strength) passing the material's threshold, or a very high heat (cook-off).
+    detonationsGas(dt) {
+      const { expl, alive, heat, detT, uav, vx, vy, px, py, mat, invm, sorted, cellStart, gw } = this;
       const now = this.time;
+      const aTU = Math.min(1, dt / DET_TU);
       const fire = [];
       for (let k = 0; k < expl.length; k++) {
         const i = expl[k];
-        if (!alive[i] || mat[i] !== EXPL) continue;
-        if (heat[i] > DET_HEAT && detT[i] > now) detT[i] = now;
+        if (!alive[i] || !MEXP[mat[i]]) continue;
+        const t = mat[i];
+        uav[i] += (Math.hypot(vx[i], vy[i]) - uav[i]) * aTU;
+        if (detT[i] > now && (uav[i] > MUCRIT[t] || heat[i] > DET_HEAT_HI)) detT[i] = now;
         if (detT[i] <= now) fire.push(i);
       }
       for (const i of fire) {
-        mat[i] = PRODUCTS;
-        invm[i] = 1 / MMASS[PRODUCTS];
+        mat[i] = PROD_OF[mat[i]];
+        invm[i] = 1 / MMASS[mat[i]];
         const xi = px[i], yi = py[i];
         const ci = ((xi - this.bx0 + 1) | 0), cj = ((yi - this.by0 + 1) | 0);
         for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
@@ -844,18 +882,18 @@
           if (cc < this.cLo || cc >= this.cHi) continue;
           for (let b = cellStart[cc], e = cellStart[cc + 1]; b < e; b++) {
             const j = sorted[b];
-            if (!alive[j] || mat[j] !== EXPL) continue;
+            if (!alive[j] || !MEXP[mat[j]]) continue;
             const ddx = px[j] - xi, ddy = py[j] - yi;
             const d = Math.sqrt(ddx * ddx + ddy * ddy);
             if (d > DET_TOUCH || d < 1e-6) continue;
-            const t = now + d / DET_SPEED;
+            const t = now + d / MDSP[mat[j]];
             if (t < detT[j]) detT[j] = t;
           }
         }
         if ((i & 3) === 0) this.events.push({ x: xi, y: yi, t: now });
       }
       let w = 0;
-      for (let k = 0; k < expl.length; k++) { const i = expl[k]; if (alive[i] && mat[i] === EXPL) expl[w++] = i; }
+      for (let k = 0; k < expl.length; k++) { const i = expl[k]; if (alive[i] && MEXP[mat[i]]) expl[w++] = i; }
       this.expl = expl.slice(0, w);
     }
 
@@ -940,11 +978,37 @@
   }
 
 
+  // Packed parameter table shared with rust/src/lib.rs (MT_*), engines/wasm.js and engines/gpu.js.
+  // Per-material tables have MAXM slots each. Pair tables are indexed a*NM+b. Scalars sit at MTL.CONST.
+  const MAXM = 32;
+  const MTL = {
+    MK: 0, MY: 32, MFR: 64, MCR: 96, MMELT: 128, MCB: 160, MEXP: 192, MGAS: 224, MDEN: 256, MMASS: 288,
+    MUCRIT: 320, MDSP: 352, GRHO0: 384, GP0: 416, GRHOC: 448, GPC: 480, PROD: 512,
+    KC: 544, CC: 1568, CONST: 2592, LEN: 2624,
+  };
+  // scalar slot i of MTL.CONST: 0..10 contact/detonation (simple model), 11..18 gas model
+  const SCALARS = [R0, HEAT_V, HEAT_K, PLASTIC_HEAT, MIN_REST, BREAK_HEAT, FRICTION, DET_HEAT, DET_SPEED, BLAST_R, BLAST_J,
+    H_SPH, SPH_KW, GAMMA_HI, GAMMA_LO, GAS_CUT, DET_TOUCH, DET_HEAT_HI, DET_TU];
+  function packMT() {
+    if (NM > MAXM) throw new Error(`too many materials for the packed table (${NM} > ${MAXM})`);
+    const mt = new Float64Array(MTL.LEN);
+    const put = (base, arr) => { for (let m = 0; m < NM; m++) mt[base + m] = arr[m]; };
+    put(MTL.MK, MK); put(MTL.MY, MY); put(MTL.MFR, MFR); put(MTL.MCR, MCR); put(MTL.MMELT, MMELT); put(MTL.MCB, MCB);
+    put(MTL.MEXP, MEXP); put(MTL.MGAS, MGAS); put(MTL.MDEN, MDEN); put(MTL.MMASS, MMASS);
+    put(MTL.MUCRIT, MUCRIT); put(MTL.MDSP, MDSP); put(MTL.GRHO0, GRHO0); put(MTL.GP0, GP0);
+    put(MTL.GRHOC, GRHOC); put(MTL.GPC, GPC); put(MTL.PROD, PROD_OF);
+    mt.set(KC, MTL.KC); mt.set(CC, MTL.CC);
+    mt.set(SCALARS, MTL.CONST);
+    return mt;
+  }
+
   // shared with the WebAssembly and WebGPU engines so all engines use identical physics parameters
   const PHYS = {
     R0, HEAT_V, HEAT_K, PLASTIC_HEAT, MIN_REST, BREAK_HEAT, FRICTION, DET_HEAT, DET_SPEED, BLAST_R, BLAST_J,
     NM, MK, MY, MFR, MCR, MMELT, MCB, MMASS, MEXP, KC, CC,
-    H_SPH, SPH_KW, GAMMA_HI, GAMMA_LO, GAS_CUT, DET_TOUCH, GAS, MGAS, MDEN, PRODUCTS, EXPL,
+    H_SPH, SPH_KW, GAMMA_HI, GAMMA_LO, GAS_CUT, DET_TOUCH, DET_HEAT_HI, DET_UCRIT, DET_TU, MUCRIT,
+    GRHO0, GP0, GRHOC, GPC, MDSP, PROD_OF, MGAS, MDEN,
+    MAXM, MTL, packMT,
   };
 
   G.ImpactSim = { Sim, MATS, MAT_BY_ID, PROJECTILES, PHYS };

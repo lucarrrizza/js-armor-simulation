@@ -6,8 +6,6 @@
   const BASE = document.currentScript.src;
   const GEN = 0, PHASE = 1, DONE = 2, QUIT = 3;
   const STACK = 1 << 19;
-  const MT_LEN = 704;
-  const MT_MGAS = 656, MT_MDEN = 672, MT_MMASS = 688;
 
   class WasmSim {
     static available() {
@@ -55,7 +53,7 @@
       const L = X.setup(n, nb, b.expl.length, PHYS.NM, b.gw, b.gh, b.bx0, b.by0, b.bx1, b.by1);
       if (!L) throw new Error('out of WebAssembly memory - try a coarser resolution');
       const buf = this.memory.buffer;
-      const lay = new Uint32Array(buf, L, 18);
+      const lay = new Uint32Array(buf, L, 19);
       const F64 = (k, len) => new Float64Array(buf, lay[k], len);
       const F32 = (k, len) => new Float32Array(buf, lay[k], len);
       const U8 = (k, len) => new Uint8Array(buf, lay[k], len);
@@ -72,23 +70,8 @@
       U32(11, nb).set(b.ba.subarray(0, nb)); U32(12, nb).set(b.bb.subarray(0, nb));
       F64(13, nb).set(b.brest.subarray(0, nb)); F64(14, nb).set(b.borig.subarray(0, nb));
       U32(15, b.expl.length).set(b.expl);
-      const mt = F64(16, MT_LEN);
-      mt.fill(0);
-      const P = PHYS, NM = P.NM;
-      [P.MK, P.MY, P.MFR, P.MCR, P.MMELT, P.MCB].forEach((arr, k) => mt.set(arr, k * 16));
-      for (let m = 0; m < NM; m++) mt[96 + m] = P.MEXP[m];
-      mt.set(P.KC, 112); mt.set(P.CC, 368);
-      mt.set([P.R0, P.HEAT_V, P.HEAT_K, P.PLASTIC_HEAT, P.MIN_REST, P.BREAK_HEAT, P.FRICTION,
-        P.DET_HEAT, P.DET_SPEED, P.BLAST_R, P.BLAST_J], 624);
-      // gas model constants: slots 11..23 of MT_CONST, see C_* in rust/src/lib.rs
-      const gas = P.GAS;
-      mt.set([P.H_SPH, P.SPH_KW, P.GAMMA_HI, P.GAMMA_LO, gas.rho0, gas.p0, gas.rhoc, gas.pc, P.GAS_CUT,
-        P.DET_TOUCH, P.MMASS[P.EXPL], P.PRODUCTS, P.EXPL], 624 + 11);
-      for (let m = 0; m < NM; m++) {
-        mt[MT_MGAS + m] = P.MGAS[m];
-        mt[MT_MDEN + m] = P.MDEN[m];
-      }
-      mt.set(P.MMASS, MT_MMASS);
+      // parameter table: same packing as the JS and WebGPU engines (PHYS.packMT in sim.js)
+      F64(16, PHYS.MTL.LEN).set(PHYS.packMT());
       this.evView = F64(17, 4096 * 3);
       X.finalize();
       this.gas = b.explosionModel === 'gas';
