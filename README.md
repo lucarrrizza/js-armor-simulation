@@ -32,6 +32,29 @@ Both engines share the same physics, so results agree to within a few percent.
 500 mm block. Use the GPU engine for anything finer than about 2 mm. When a frame can't keep up, the
 sim runs in slow motion ("slowed" in the stats) and the page stays responsive.
 
+## Explosives
+
+Explosive charges are SPH gas particles. Each one has a density, a pressure and an internal energy.
+
+- **Detonation products** use a gamma-law EOS, `P = (γ−1)ρu`. γ falls from 3 when dense to 1.4 when
+  dilute, so the gas stays physical as it expands. Conversion from explosive keeps the chemical energy
+  as internal energy.
+- **Shock initiation**: the front spreads from a fuze or from impact, and each explosive particle
+  detonates once a shock with enough speed reaches it. Each material has its own detonation speed and
+  critical shock (`mat` table in `sim.js`).
+- **Artificial viscosity** (Monaghan, α = 1, β = 2) keeps shocks from ringing and stops product
+  particles spiking in speed.
+- **Fuzes** (per projectile body): `impact`, `delay` (impact + N µs), `time` (fires at N µs) and
+  `none`. A detonator point can also be placed in the drawing tools.
+- **Shaped charge** (`heatRound`): a copper V-liner over a Comp B fill, with a time fuze at standoff.
+  The liner needs res ≤ 1 mm to be at least 3 particles thick; the UI warns otherwise.
+- **Pressure view** shows the signed per-particle pressure (blue compression, red tension), so you can
+  watch the stress waves.
+
+Limits: the model is 2D, so charges behave like slabs (round) and wedges (cones). Energy is not exact:
+it drifts about 9% over a 25 µs run at the default step, from a first-order time-step error. For an 8 mm
+charge on a 5 mm plate at res 3, the simulated plate speed is about 10% below the Gurney estimate.
+
 ## Rendering
 
 Pick one under **Playback → Renderer** (or add `?render=cinematic|standard|2d` to the URL):

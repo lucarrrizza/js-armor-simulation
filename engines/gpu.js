@@ -33,7 +33,7 @@ const MMELT: u32 = ${MT.MMELT}u; const MCB: u32 = ${MT.MCB}u; const MEXP: u32 = 
 const KC: u32 = ${MT.KC}u; const CC: u32 = ${MT.CC}u; const CN: u32 = ${MT.CONST}u;
 const MGAS: u32 = ${MT.MGAS}u; const MDEN: u32 = ${MT.MDEN}u; const MMASS: u32 = ${MT.MMASS}u;
 const MUCRIT: u32 = ${MT.MUCRIT}u; const MDSP: u32 = ${MT.MDSP}u; const MPROD: u32 = ${MT.PROD}u;
-const GRHO0: u32 = ${MT.GRHO0}u; const GP0: u32 = ${MT.GP0}u; const GRHOC: u32 = ${MT.GRHOC}u; const GPC: u32 = ${MT.GPC}u;
+const GRHO0: u32 = ${MT.GRHO0}u; const GU0: u32 = ${MT.GU0}u;
 struct Params {
   n: u32, nb: u32, nexpl: u32, gw: u32, gh: u32, cells: u32, nm: u32, lo: u32,
   gx0: f32, gy0: f32, bx0: f32, by0: f32, bx1: f32, by1: f32, dtStab: f32, gas: u32,
@@ -54,11 +54,17 @@ fn dkw(q: f32) -> f32 {
   if (q < 2.0) { let t = 2.0 - q; return -0.75 * t * t; }
   return 0.0;
 }
-// gas equation of state, same as pressure() in sim.js
-fn gpress(rho: f32, rhoc: f32, rho0: f32, p0: f32, pc: f32, ghi: f32, glo: f32) -> f32 {
-  if (rho >= rhoc) { return p0 * pow(rho / rho0, ghi); }
-  return pc * pow(rho / rhoc, glo);
+// gas equation of state, same as gammaOf() and pressure() in sim.js: P = (gamma - 1) rho u
+fn gammaOf(x2: f32, ghi: f32, glo: f32, kn: f32) -> f32 {
+  return glo + (ghi - glo) * (1.0 + kn) * x2 / (x2 + kn);
 }
+// sound speed of a product, same as sph() in sim.js
+fn soundSpeed(rho: f32, p: f32, rho0: f32, ghi: f32, glo: f32, kn: f32) -> f32 {
+  let x = rho / rho0;
+  return sqrt(gammaOf(x * x, ghi, glo, kn) * p / rho);
+}
+// Monaghan artificial viscosity for approaching product pairs, same constants as sim.js
+const VISC_ALPHA: f32 = 1.0; const VISC_BETA: f32 = 2.0; const VISC_ETA2: f32 = 0.01;
 `;
 
   // binding declarations; each pipeline lists the ones it uses
@@ -83,13 +89,14 @@ fn gpress(rho: f32, rhoc: f32, rho0: f32, p0: f32, pc: f32, ghi: f32, glo: f32) 
     bv: ['storage', 'var<storage, read_write> bv: array<f32>;'], // per-bond virial f*len, subtracted from both ends
     rp: ['storage', 'var<storage, read_write> rp: array<f32>;'], // per-particle pressure, for readback and the renderer
     fz: ['read-only-storage', 'var<storage, read> fz: array<f32>;'], // impact fuze delay per explosive (time units)
+    gu: ['storage', 'var<storage, read_write> gu: array<vec2<f32>>;'], // gas: (specific internal energy u, du/dt)
   };
 
   const KERNELS = {
     dt: [['P', 'st', 'mt'], /* wgsl */`
 @compute @workgroup_size(1) fn main() {
   let v = sqrt(bitcast<f32>(atomicLoad(&st.vacc)));
-  var full = min(P.dtStab, 0.15 / max(1e-6, v));
+  var full = min(P.dtStab, 0.05 / max(1e-6, v));
   // CFL limit of the detonation products, from the sound speed the previous step's pressure pass found
   if (P.gas != 0u) {
     let c2 = bitcast<f32>(atomicLoad(&st.c2));
@@ -239,7 +246,7 @@ fn gpress(rho: f32, rhoc: f32, rho0: f32, p0: f32, pc: f32, ghi: f32, glo: f32) 
   bv[b] = f * len;
 }`],
 
-    integrate: [['P', 'st', 'pv', 'pa', 'pm', 'adj', 'bout', 'bv', 'prs'], /* wgsl */`
+    integrate: [['P', 'st', 'pv', 'pa', 'pm', 'adj', 'bout', 'bv', 'prs', 'mt', 'gu'], /* wgsl */`
 var<workgroup> wmax: atomic<u32>;
 fn one(i: u32, dt: f32) -> f32 {
   let m = pm[i];
@@ -278,6 +285,7 @@ fn one(i: u32, dt: f32) -> f32 {
     }
   }
   pv[i] = p;
+  if (mt[MGAS + (m.w & 255u)] != 0.0) { let g = gu[i]; gu[i] = vec2<f32>(max(0.0, g.x + g.y * dt), g.y); }
   return v2;
 }
 @compute @workgroup_size(${WG}) fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
@@ -325,7 +333,7 @@ fn one(i: u32, dt: f32) -> f32 {
   pg[i] = vec2<f32>(sum * mt[CN + 12u], 0.0);
 }`],
 
-    gasPressure: [['P', 'st', 'pm', 'mt', 'pg'], /* wgsl */`
+    gasPressure: [['P', 'st', 'pm', 'mt', 'pg', 'gu'], /* wgsl */`
 var<workgroup> wc2: atomic<u32>;
 @compute @workgroup_size(${WG}) fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
   if (li == 0u) { atomicStore(&wc2, 0u); }
@@ -337,10 +345,11 @@ var<workgroup> wc2: atomic<u32>;
     let mi = m.w & 255u;
     if ((m.w & ALIVE) != 0u && mt[MGAS + mi] != 0.0) {
       let rho = pg[i].x;
-      let rhoc = mt[GRHOC + mi];
-      let p = gpress(rho, rhoc, mt[GRHO0 + mi], mt[GP0 + mi], mt[GPC + mi], mt[CN + 13u], mt[CN + 14u]);
+      let x = rho / mt[GRHO0 + mi];
+      let g = gammaOf(x * x, mt[CN + 13u], mt[CN + 14u], mt[CN + 19u]);
+      let p = (g - 1.0) * rho * gu[i].x;
       pg[i] = vec2<f32>(rho, p);
-      c2 = select(mt[CN + 14u], mt[CN + 13u], rho >= rhoc) * p / rho;
+      c2 = g * p / rho;
       if (rho < mt[CN + 15u] * mt[GRHO0 + mi]) { pm[i].w = m.w & ~ALIVE; }
     }
   }
@@ -349,7 +358,7 @@ var<workgroup> wc2: atomic<u32>;
   if (li == 0u) { atomicMax(&st.c2, atomicLoad(&wc2)); }
 }`],
 
-    gasForce: [['P', 'st', 'pv', 'pa', 'pm', 'gcnt', 'gslot', 'mt', 'pg'], /* wgsl */`
+    gasForce: [['P', 'st', 'pv', 'pa', 'pm', 'gcnt', 'gslot', 'mt', 'pg', 'gu'], /* wgsl */`
 @compute @workgroup_size(${WG}) fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let i = gid.x;
   if (i >= P.n || P.gas == 0u || st.dt == 0.0) { return; }
@@ -366,6 +375,8 @@ var<workgroup> wc2: atomic<u32>;
   if (self_gas) { let gi = pg[i]; s_self = gi.y / (gi.x * gi.x); }
   let ci = i32(p.x - P.gx0); let cj = i32(p.y - P.gy0);
   var f = vec2<f32>(0.0, 0.0);
+  var w = 0.0;
+  var wv = 0.0;
   for (var dy = -3; dy <= 3; dy++) {
     for (var dx = -3; dx <= 3; dx++) {
       let X = ci + dx; let Y = cj + dy;
@@ -388,11 +399,28 @@ var<workgroup> wc2: atomic<u32>;
         let dwdr = sphkw * dkw(d / h) / h; // <= 0
         var sj = 0.0;
         if (j_gas) { let gj = pg[j]; sj = gj.y / (gj.x * gj.x); }
-        // pair term m_i m_j (S_i + S_j) dW/dr, with S_j only for products; same as the scatter in sim.js
-        f += m_self * mt[MMASS + mjm] * (s_self + sj) * dwdr / d * ex;
+        // artificial viscosity for approaching product pairs (same as sim.js sph())
+        var pi = 0.0;
+        if (self_gas && j_gas) {
+          let dv = dot(p.zw - pv[j].zw, ex);
+          if (dv > 0.0) {
+            let gi = pg[i]; let gj = pg[j];
+            let mu = -h * dv / (d2 + VISC_ETA2 * h * h);
+            let cbar = 0.5 * (soundSpeed(gi.x, gi.y, mt[GRHO0 + mi], mt[CN + 13u], mt[CN + 14u], mt[CN + 19u]) + soundSpeed(gj.x, gj.y, mt[GRHO0 + mjm], mt[CN + 13u], mt[CN + 14u], mt[CN + 19u]));
+            let rbar = 0.5 * (gi.x + gj.x);
+            pi = (VISC_ALPHA * cbar * (-mu) + VISC_BETA * mu * mu) / rbar;
+          }
+        }
+        // pair term m_i m_j (S_i + S_j + Pi) dW/dr, with S_j only for products; same as the scatter in sim.js
+        f += m_self * mt[MMASS + mjm] * (s_self + sj + pi) * dwdr / d * ex;
+        // energy: work term of du_i/dt = (S_i + Pi/2) sum_j m_j (v_i - v_j).grad_i W (sim.js sph())
+        let mw = mt[MMASS + mjm] * (dwdr / d);
+        w += mw * dot(p.zw - pv[j].zw, ex);
+        wv += mw * 0.5 * pi * dot(p.zw - pv[j].zw, ex);
       }
     }
   }
+  if (self_gas) { gu[i] = vec2<f32>(gu[i].x, -s_self * w - wv); }
   let a = pa[i];
   pa[i] = vec4<f32>(a.xy + f, a.zw);
 }`],
@@ -506,7 +534,7 @@ var<workgroup> wc2: atomic<u32>;
   }
 }`],
 
-    det3: [['P', 'st', 'pv', 'pm', 'expl', 'ev', 'mt'], /* wgsl */`
+    det3: [['P', 'st', 'pv', 'pm', 'expl', 'ev', 'mt', 'gu'], /* wgsl */`
 @compute @workgroup_size(${WG}) fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let k = gid.x;
   if (k >= P.nexpl || st.dt == 0.0) { return; }
@@ -518,6 +546,7 @@ var<workgroup> wc2: atomic<u32>;
     let prod = u32(mt[MPROD + (w & 255u)]);
     pm[i].w = (w & ~(FIRE | 255u)) | prod;
     pm[i].x = bitcast<u32>(1.0 / mt[MMASS + prod]);
+    gu[i] = vec2<f32>(mt[GU0 + prod], 0.0);
   } else {
     pm[i].w = w & ~(FIRE | ALIVE);
   }
@@ -678,6 +707,7 @@ var<workgroup> wc2: atomic<u32>;
         mt: mk(mt, ST),
         expl: mk(nexpl ? explP : null, ST, nexpl * 4),
         pg: mk(null, ST, n * 8),
+        gu: mk(null, ST, n * 8),
         uav: mk(null, ST, n * 4),
         prs: mk(null, ST, n * 4),
         bv: mk(null, ST, nb * 4),
@@ -729,7 +759,7 @@ var<workgroup> wc2: atomic<u32>;
     async advanceInner(us, maxSteps) {
       const dev = this.device, gen = this.gen, bufs = this.bufs;
       const remaining = us / this.usPerT;
-      const dtEst = Math.min(this.dtStab, 0.15 / Math.max(1e-6, this.vmax));
+      const dtEst = Math.min(this.dtStab, 0.05 / Math.max(1e-6, this.vmax));
       // Keep each submission short (~40 ms of GPU work): long batches stall the UI and can trip the
       // OS GPU watchdog (Windows resets the driver after ~2 s), which matters at fine resolutions.
       const budget = Math.max(2, Math.floor(BATCH_MS / this.msPerStep));

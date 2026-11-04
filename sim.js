@@ -26,9 +26,11 @@
   const H_SPH = 1.3;          // SPH smoothing length, in particle spacings
   const GAMMA_HI = 3;         // isentrope exponent for dense products
   const GAMMA_LO = 1.4;       // isentrope exponent for expanded products
-  const RHO_LO = 0.1;         // density fraction (of rho0) where the exponent changes
+  const GAMMA_KNEE = 0.01;    // smooth knee (in (rho/rho0)^2) where the exponent falls from GAMMA_HI to GAMMA_LO
   const GAS_E0 = 364;         // chemical energy per unit mass, (100 m/s)^2 units (Gurney-like)
   const GAS_CUT = 0.01;       // products below this fraction of rho0 are removed as smoke
+  const VISC_ALPHA = 1.0, VISC_BETA = 2.0; // Monaghan artificial viscosity for approaching product pairs
+  const VISC_ETA2 = 0.01;     // softening (eta h)^2 in the viscosity denominator
   const DET_TOUCH = 1.2;      // the detonation front only spreads to touching explosive particles
   const SPH_KW = 10 / (7 * Math.PI) / (H_SPH * H_SPH); // 2D cubic spline normalisation
   // cubic spline kernel w(q) and its derivative, q = r / H_SPH, support 2
@@ -83,8 +85,8 @@
     return s * SPH_KW;
   }
   // per-material gas tables. Each explosive and its product twin share one EOS:
-  // rho0 = reference density, p0 = pressure at rho0, rhoc/pc = where the isentrope exponent changes
-  const GRHO0 = new Float64Array(NM), GP0 = new Float64Array(NM), GRHOC = new Float64Array(NM), GPC = new Float64Array(NM);
+  // GRHO0 = reference density, GU0 = specific internal energy of the products at the CJ state
+  const GRHO0 = new Float64Array(NM), GU0 = new Float64Array(NM);
   const MDSP = new Float64Array(NM), MUCRIT = new Float64Array(NM);
   const PROD_OF = new Int32Array(NM).fill(-1);
   {
@@ -92,17 +94,20 @@
     for (const e of EXPLOSIVES) {
       const ex = MAT_BY_ID[e.id], tw = MAT_BY_ID[e.id === 'explosive' ? 'products' : 'prod_' + e.id];
       const rho0 = ex.m * LAT;
-      const p0 = (GAMMA_HI - 1) * rho0 * GAS_E0 * Math.pow(e.v / 2700, 2);
-      const rhoc = RHO_LO * rho0, pc = p0 * Math.pow(RHO_LO, GAMMA_HI);
+      const u0 = GAS_E0 * Math.pow(e.v / 2700, 2);
       for (const k of [ex.index, tw.index]) {
-        GRHO0[k] = rho0; GP0[k] = p0; GRHOC[k] = rhoc; GPC[k] = pc;
+        GRHO0[k] = rho0; GU0[k] = u0;
         MDSP[k] = e.D; MUCRIT[k] = DET_UCRIT / e.sens;
       }
       PROD_OF[ex.index] = tw.index;
     }
   }
-  function pressure(rho, t) {
-    return rho >= GRHOC[t] ? GP0[t] * Math.pow(rho / GRHO0[t], GAMMA_HI) : GPC[t] * Math.pow(rho / GRHOC[t], GAMMA_LO);
+  // adiabatic exponent of the products at density rho: GAMMA_HI at rho0, falling to GAMMA_LO when dilute
+  function gammaOf(x2) { return GAMMA_LO + (GAMMA_HI - GAMMA_LO) * (1 + GAMMA_KNEE) * x2 / (x2 + GAMMA_KNEE); }
+  // ideal-gas form P = (gamma - 1) rho u, with u the specific internal energy (carried per particle)
+  function pressure(rho, u, t) {
+    const x = rho / GRHO0[t];
+    return (gammaOf(x * x) - 1) * rho * u;
   }
 
   const MK = new Float64Array(NM), MY = new Float64Array(NM), MFR = new Float64Array(NM),
@@ -151,6 +156,8 @@
     hesh: { name: 'HESH (thin case, plastic explosive)', mat: 'mild', D: 75, L: 150, v: 800, fill: 'pe4', shell: 3, fuze: { type: 'delay', delay: 15 } },
     he: { name: 'HE fragmentation shell', mat: 'mild', D: 100, L: 350, v: 600, fill: 'compb', shell: 8, fuze: { type: 'impact', delay: 0 } },
     aphe: { name: 'APHE (base-fuzed, filled cavity)', mat: 'hhs', D: 100, L: 350, v: 850, fill: 'tnt', shell: 12, fuze: { type: 'delay', delay: 20 } },
+    // shaped charge: open-front steel case, copper V-liner, compb fill fired from the base at a standoff
+    heatRound: { name: 'HEAT round (shaped charge, V-liner)', mat: 'mild', D: 100, L: 300, v: 300, fill: 'compb', shell: 6, fuze: { type: 'time', standoff: 100 } },
   };
   // Impact fuzes arm once the explosive is moving faster than ARM_SPEED and fire when its speed drops
   // below IMPACT_DROP times its smoothed (shock) speed.
@@ -221,6 +228,31 @@
         bodies.push({
           mat: fill, x0: fx0, x1: fx1, R: R - t, vel: () => v, radius: (lx) => (lx < fx0 || lx > fx1 ? -1 : inner(lx)),
           fuze: true,
+        });
+        break;
+      }
+      case 'heatRound': {
+        // the liner is a V (apex 22 degrees off the axis) with its apex on the base side, so the jet forms in front of it
+        const t = Math.max(0.6, u(p.shell ?? 6));
+        const Rl = Math.max(0.6, R - t), xT = L - t;
+        const s = 1 / Math.tan(22 * Math.PI / 180);      // dx per unit radius along the liner
+        const xa = Math.max(t, xT - s * Rl);            // apex on the axis
+        const lt = Math.max(0.6, u(3));                  // liner thickness (3 mm)
+        const bh = (lt / 2) * Math.sqrt(1 + s * s);      // half-width of the liner band along x
+        const surf = (ly) => xa + s * Math.abs(ly);
+        const withLiner = p.liner !== false;
+        bodies.push({
+          mat: p.mat, x0: 0, x1: L, R, radius: () => R, vel: () => v,
+          exclude: (lx, ly) => lx > t && Math.abs(ly) < Rl,   // closed base, open front
+        });
+        if (withLiner) bodies.push({
+          mat: 'copper', x0: xa - bh, x1: xT + bh, R: Rl, radius: () => Rl, vel: () => v,
+          exclude: (lx, ly) => Math.abs(lx - surf(ly)) > bh,
+        });
+        bodies.push({
+          mat: p.fill || PROJECTILES.heatRound.fill, x0: t, x1: xT, R: Rl, radius: () => Rl, vel: () => v, fuze: true,
+          fuzeMax: t + u(4),   // the base detonator: only the first 4 mm of fill is fuzed, the rest is lit by the detonation front
+          exclude: withLiner ? (lx, ly) => lx >= surf(ly) - bh : () => false,
         });
         break;
       }
@@ -484,14 +516,41 @@
 
       // ---- projectile ----
       const bodies = projectileBodies(scn.projectile, u);
-      const pFuze = scn.projectile.fuze || (PROJECTILES[scn.projectile.type] || {}).fuze || null;
+      let pFuze = scn.projectile.fuze || (PROJECTILES[scn.projectile.type] || {}).fuze || null;
+      // a standoff fuze fires once the round has covered the standoff distance (time = d / v), so it starts that far back
+      let standoffU = 0;
+      if (pFuze && pFuze.standoff > 0) {
+        standoffU = u(pFuze.standoff);
+        pFuze = Object.assign({}, pFuze, { type: 'time', delay: pFuze.standoff * 1000 / Math.max(1, scn.projectile.v) });
+      }
       const maxR = Math.max(0, ...bodies.map((b) => b.R));
       let frontX = Infinity;
       for (let i = 0; i < T.x.length; i++) if (Math.abs(T.y[i]) < maxR + 1 && T.x[i] < frontX) frontX = T.x[i];
       if (!isFinite(frontX)) frontX = 0;
       const tipLocal = Math.max(0, ...bodies.map((b) => b.x1));
-      const offX = frontX - 3 - tipLocal;
+      const offX = frontX - 3 - tipLocal - standoffU;
       const offY = u(scn.offsetY || 0);
+      // each body has its own row lattice, so neighbouring bodies (case / liner / fill) can land closer than a spacing;
+      // a later body's point that would sit on top of an earlier one is skipped, so the interfaces start at rest
+      const cellGrid = new Map();
+      const cellKey = (gx, gy) => gx + ',' + gy;
+      const tooClose = (px, py) => {
+        const cx = Math.floor(px), cy = Math.floor(py);
+        for (let gx = cx - 1; gx <= cx + 1; gx++) for (let gy = cy - 1; gy <= cy + 1; gy++) {
+          const cell = cellGrid.get(cellKey(gx, gy));
+          if (!cell) continue;
+          for (const q of cell) {
+            const dx = T.x[q] - px, dy = T.y[q] - py;
+            if (dx * dx + dy * dy < 0.64) return true;
+          }
+        }
+        return false;
+      };
+      const registerLast = () => {
+        const k = T.x.length - 1, key = cellKey(Math.floor(T.x[k]), Math.floor(T.y[k]));
+        if (!cellGrid.has(key)) cellGrid.set(key, []);
+        cellGrid.get(key).push(k);
+      };
       for (const b of bodies) {
         const m = MAT_BY_ID[b.mat].index;
         const R = b.R;
@@ -500,18 +559,22 @@
             const rad = b.radius(x);
             if (rad < 0 || Math.abs(y) > rad + 1e-6) continue;
             if (b.exclude && b.exclude(x, y)) continue;
-            if (b.fuze && MEXP[m] && pFuze && pFuze.type !== 'none') {
+            if (tooClose(offX + x, offY + y)) continue;
+            if (b.fuze && MEXP[m] && pFuze && pFuze.type !== 'none' && (b.fuzeMax === undefined || x <= b.fuzeMax)) {
               add(offX + x, offY + y, b.vel(x), 0, m, 1, false);
               const k = T.x.length - 1;
               T.fzm[k] = pFuze.type === 'time' ? 2 : 1;
               T.fz[k] = Math.max(0, pFuze.delay || 0) / this.usPerT;
+              registerLast();
               continue;
             }
             add(offX + x, offY + y, b.vel(x), 0, m, 1, false);
+            registerLast();
           }
         }
         bodyId++;
       }
+
       this.entryX = this.armorFront / Math.max(0.05, cs);
 
       // ---- user drawing: replaces / erases base material, adds new bodies ----
@@ -555,6 +618,8 @@
       this.pres = new Float32Array(n);
       this.detT = new Float64Array(n).fill(Infinity);
       this.uav = new Float64Array(n);  // smoothed speed of explosive particles (shock strength), persists across steps
+      this.uE = new Float64Array(n);   // specific internal energy of detonation products (gas EOS state)
+      this.dudt = new Float64Array(n); // rate of change of uE from the SPH work term, set in sph()
       this.cellOf = new Int32Array(n); this.sorted = new Int32Array(n);
       const expl = [];
       this.projMass0 = 0;
@@ -667,7 +732,7 @@
         for (let k = 0; k < m; k++) out[k] = arr[sorted[k]];
         return out;
       };
-      for (const key of ['px', 'py', 'vx', 'vy', 'mat', 'grp', 'body', 'alive', 'invm', 'heat', 'detT', 'uav', 'pres', 'fz', 'fzm']) this[key] = perm(this[key]);
+      for (const key of ['px', 'py', 'vx', 'vy', 'mat', 'grp', 'body', 'alive', 'invm', 'heat', 'detT', 'uav', 'uE', 'pres', 'fz', 'fzm']) this[key] = perm(this[key]);
       this.n = m;
       // explosive index list refers to storage positions, so it must be rebuilt after the permutation
       const exNew = [];
@@ -725,9 +790,9 @@
     // follows the isentrope of each explosive's products. Each product pushes every neighbour within 2h,
     // and non-product neighbours get the equal and opposite force, so momentum is conserved.
     sph() {
-      const { sorted, nAlive, px, py, mat, alive, fx, fy, cellStart, gw, gh, cLo, cHi, n } = this;
-      if (!this.rhoS || this.rhoS.length < n) { this.rhoS = new Float64Array(n); this.prS = new Float64Array(n); }
-      const rho = this.rhoS, pr = this.prS;
+      const { sorted, nAlive, px, py, vx, vy, mat, alive, fx, fy, cellStart, gw, gh, cLo, cHi, n, uE, dudt } = this;
+      if (!this.rhoS || this.rhoS.length < n) { this.rhoS = new Float64Array(n); this.prS = new Float64Array(n); this.csS = new Float64Array(n); }
+      const rho = this.rhoS, pr = this.prS, cs = this.csS;
       const H2 = (2 * H_SPH) * (2 * H_SPH);
       const gas = [];
       for (let a = 0; a < nAlive; a++) if (MGAS[mat[sorted[a]]]) gas.push(sorted[a]);
@@ -748,7 +813,7 @@
             if (cc < cLo || cc >= cHi) continue;
             for (let b = cellStart[cc], e = cellStart[cc + 1]; b < e; b++) {
               const j = sorted[b];
-              if (!MDEN[mat[j]]) continue;
+              if (!MDEN[mat[j]] || !alive[j]) continue;
               const ex = px[j] - xi, ey = py[j] - yi, d2 = ex * ex + ey * ey;
               if (d2 < H2) s += MMASS[mat[j]] * kw(Math.sqrt(d2) / H_SPH);
             }
@@ -761,21 +826,24 @@
       let cmax2 = 0;
       for (const i of gas) {
         const r = rho[i], t = mat[i];
-        pr[i] = pressure(r, t);
+        pr[i] = pressure(r, uE[i], t);
         this.pres[i] = pr[i];
-        const c2 = (r >= GRHOC[t] ? GAMMA_HI : GAMMA_LO) * pr[i] / r;
+        const c2 = gammaOf((r / GRHO0[t]) ** 2) * pr[i] / r;
+        cs[i] = Math.sqrt(c2);
         if (c2 > cmax2) cmax2 = c2;
         if (r < GAS_CUT * GRHO0[t]) alive[i] = 0;
+        dudt[i] = 0;
       }
       this.gasDt = 0.4 * H_SPH / Math.sqrt(cmax2);
 
       // pair forces: F_i = m_i m_j S dW/dr (x_i - x_j)/r with S = P_i/rho_i^2 (+ P_j/rho_j^2 for products)
+      // energy: du_i/dt = S_i sum_j m_j (v_i - v_j).grad_i W, which conserves total energy with the forces above
       for (const i of gas) {
         if (!alive[i]) continue;
-        const xi = px[i], yi = py[i];
+        const xi = px[i], yi = py[i], vxi = vx[i], vyi = vy[i];
         const Si = pr[i] / (rho[i] * rho[i]), mi = MMASS[mat[i]];
         const ci = (xi - this.bx0 + 1) | 0, cj = (yi - this.by0 + 1) | 0;
-        let fxi = 0, fyi = 0;
+        let fxi = 0, fyi = 0, work = 0, workV = 0;
         for (let dy = -3; dy <= 3; dy++) {
           const Y = cj + dy;
           if (Y < 0 || Y >= gh) continue;
@@ -791,16 +859,29 @@
               if (d2 >= H2 || d2 < 1e-12) continue;
               const d = Math.sqrt(d2);
               const dwdr = SPH_KW * dkw(d / H_SPH) / H_SPH; // <= 0
+              const dv = (vxi - vx[j]) * ex + (vyi - vy[j]) * ey; // v_ij . (x_j - x_i)
               let S = Si;
               const gasJ = MGAS[mat[j]];
-              if (gasJ) S += pr[j] / (rho[j] * rho[j]);
+              let pi = 0;
+              if (gasJ) {
+                S += pr[j] / (rho[j] * rho[j]);
+                if (dv > 0) { // approaching: artificial viscosity (Monaghan), symmetric in i and j
+                  const mu = -H_SPH * dv / (d2 + VISC_ETA2 * H_SPH * H_SPH); // h v_ij.r_ij / (r^2 + eta^2 h^2), <= 0
+                  pi = (VISC_ALPHA * 0.5 * (cs[i] + cs[j]) * (-mu) + VISC_BETA * mu * mu) / (0.5 * (rho[i] + rho[j]));
+                  S += pi;
+                }
+              }
               const k = mi * MMASS[mat[j]] * S * dwdr / d;
               fxi += k * ex; fyi += k * ey;
               if (!gasJ) { fx[j] -= k * ex; fy[j] -= k * ey; }
+              const mj = MMASS[mat[j]] * dwdr / d;
+              work += mj * dv;
+              workV += mj * 0.5 * pi * dv;
             }
           }
         }
         fx[i] += fxi; fy[i] += fyi;
+        dudt[i] = -Si * work - workV;
       }
     }
 
@@ -890,7 +971,7 @@
     }
 
     integrate(dt) {
-      const { n, px, py, vx, vy, fx, fy, alive, heat, invm } = this;
+      const { n, px, py, vx, vy, fx, fy, alive, heat, invm, mat, uE, dudt } = this;
       const decay = Math.exp(-dt / 20);
       const bx0 = this.bx0, bx1 = this.bx1, by0 = this.by0, by1 = this.by1;
       let v2max = 0;
@@ -901,6 +982,7 @@
         let a = vx[i] + fx[i] * im * dt, c = vy[i] + fy[i] * im * dt;
         vx[i] = a; vy[i] = c;
         px[i] += a * dt; py[i] += c * dt;
+        if (MGAS[mat[i]]) { const u = uE[i] + dudt[i] * dt; uE[i] = u > 0 ? u : 0; }
         let h = heat[i] * decay;
         heat[i] = h > 2 ? 2 : h;
         const s = a * a + c * c;
@@ -919,7 +1001,7 @@
     // spreads to touching explosive particles. Initiation is either the smoothed particle speed of the
     // explosive (shock strength) passing the material's threshold, or a very high heat (cook-off).
     detonationsGas(dt) {
-      const { expl, alive, heat, detT, uav, vx, vy, px, py, mat, invm, sorted, cellStart, gw, fz, fzm } = this;
+      const { expl, alive, heat, detT, uav, vx, vy, px, py, mat, invm, sorted, cellStart, gw, fz, fzm, uE } = this;
       const now = this.time;
       const aTU = Math.min(1, dt / DET_TU);
       const fire = [];
@@ -938,6 +1020,8 @@
       for (const i of fire) {
         mat[i] = PROD_OF[mat[i]];
         invm[i] = 1 / MMASS[mat[i]];
+        // the chemical energy enters as the CJ internal energy of the products
+        uE[i] = GU0[mat[i]];
         const xi = px[i], yi = py[i];
         const ci = ((xi - this.bx0 + 1) | 0), cj = ((yi - this.by0 + 1) | 0);
         for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
@@ -1010,7 +1094,7 @@
       let remaining = us / this.usPerT;
       let steps = 0;
       while (remaining > 1e-9 && steps < maxSteps && (steps === 0 || performance.now() - t0 < budgetMs)) {
-        const dt = Math.min(this.dtStab, this.gasDt, 0.15 / Math.max(1e-6, this.vmax), remaining);
+        const dt = Math.min(this.dtStab, this.gasDt, 0.05 / Math.max(1e-6, this.vmax), remaining);
         this.step(dt);
         remaining -= dt;
         steps++;
@@ -1048,20 +1132,20 @@
   const MAXM = 32;
   const MTL = {
     MK: 0, MY: 32, MFR: 64, MCR: 96, MMELT: 128, MCB: 160, MEXP: 192, MGAS: 224, MDEN: 256, MMASS: 288,
-    MUCRIT: 320, MDSP: 352, GRHO0: 384, GP0: 416, GRHOC: 448, GPC: 480, PROD: 512,
+    MUCRIT: 320, MDSP: 352, GRHO0: 384, GU0: 416, PROD: 448,
     KC: 544, CC: 1568, CONST: 2592, LEN: 2624,
   };
-  // scalar slot i of MTL.CONST: 0..10 contact/detonation (simple model), 11..18 gas model
+  // scalar slot i of MTL.CONST: 0..10 contact/detonation (simple model), 11..19 gas model
   const SCALARS = [R0, HEAT_V, HEAT_K, PLASTIC_HEAT, MIN_REST, BREAK_HEAT, FRICTION, DET_HEAT, DET_SPEED, BLAST_R, BLAST_J,
-    H_SPH, SPH_KW, GAMMA_HI, GAMMA_LO, GAS_CUT, DET_TOUCH, DET_HEAT_HI, DET_TU];
+    H_SPH, SPH_KW, GAMMA_HI, GAMMA_LO, GAS_CUT, DET_TOUCH, DET_HEAT_HI, DET_TU, GAMMA_KNEE];
   function packMT() {
     if (NM > MAXM) throw new Error(`too many materials for the packed table (${NM} > ${MAXM})`);
     const mt = new Float64Array(MTL.LEN);
     const put = (base, arr) => { for (let m = 0; m < NM; m++) mt[base + m] = arr[m]; };
     put(MTL.MK, MK); put(MTL.MY, MY); put(MTL.MFR, MFR); put(MTL.MCR, MCR); put(MTL.MMELT, MMELT); put(MTL.MCB, MCB);
     put(MTL.MEXP, MEXP); put(MTL.MGAS, MGAS); put(MTL.MDEN, MDEN); put(MTL.MMASS, MMASS);
-    put(MTL.MUCRIT, MUCRIT); put(MTL.MDSP, MDSP); put(MTL.GRHO0, GRHO0); put(MTL.GP0, GP0);
-    put(MTL.GRHOC, GRHOC); put(MTL.GPC, GPC); put(MTL.PROD, PROD_OF);
+    put(MTL.MUCRIT, MUCRIT); put(MTL.MDSP, MDSP); put(MTL.GRHO0, GRHO0); put(MTL.GU0, GU0);
+    put(MTL.PROD, PROD_OF);
     mt.set(KC, MTL.KC); mt.set(CC, MTL.CC);
     mt.set(SCALARS, MTL.CONST);
     return mt;
@@ -1071,8 +1155,8 @@
   const PHYS = {
     R0, HEAT_V, HEAT_K, PLASTIC_HEAT, MIN_REST, BREAK_HEAT, FRICTION, DET_HEAT, DET_SPEED, BLAST_R, BLAST_J,
     NM, MK, MY, MFR, MCR, MMELT, MCB, MMASS, MEXP, KC, CC,
-    H_SPH, SPH_KW, GAMMA_HI, GAMMA_LO, GAS_CUT, DET_TOUCH, DET_HEAT_HI, DET_UCRIT, DET_TU, MUCRIT,
-    GRHO0, GP0, GRHOC, GPC, MDSP, PROD_OF, MGAS, MDEN,
+    H_SPH, SPH_KW, GAMMA_HI, GAMMA_LO, GAS_CUT, DET_TOUCH, DET_HEAT_HI, DET_UCRIT, DET_TU, GAMMA_KNEE, MUCRIT,
+    GRHO0, GU0, MDSP, PROD_OF, MGAS, MDEN,
     MAXM, MTL, packMT,
   };
 

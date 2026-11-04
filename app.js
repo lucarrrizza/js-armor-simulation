@@ -132,8 +132,10 @@
       return;
     }
     const heavy = engineKind === 'js' && sim.n > 60000;
+    const thinLiner = scenario.projectile && scenario.projectile.type === 'heatRound' && scenario.res > 1;
     $('count').textContent = `${sim.n.toLocaleString()} particles · ${sim.nb.toLocaleString()} bonds` +
-      (heavy ? ' — heavy! try the GPU engine or a coarser resolution' : '');
+      (heavy ? ' — heavy! try the GPU engine or a coarser resolution' : '') +
+      (thinLiner ? ' — the 3 mm copper liner is under-resolved above 1 mm' : '');
     if (renderer) renderer.reset();
     lastFxUs = 0;
     setupBuffers();
